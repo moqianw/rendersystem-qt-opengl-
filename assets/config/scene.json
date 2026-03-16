@@ -1,0 +1,76 @@
+{
+  "window": {
+    "title": "OpenGL JSON Renderer",
+    "width": 1600,
+    "height": 900,
+    "clearColor": [0.93, 0.95, 0.98, 1.0],
+    "captureMouse": true
+  },
+  "camera": {
+    "position": [8.5, 6.0, 14.0],
+    "yaw": -125.0,
+    "pitch": -18.0,
+    "fov": 45.0,
+    "nearClip": 0.1,
+    "farClip": 200.0,
+    "moveSpeed": 7.5,
+    "lookSpeed": 0.12
+  },
+  "lights": [
+    {
+      "position": [10.0, 12.0, 8.0],
+      "color": [1.0, 0.97, 0.92],
+      "ambientStrength": 0.18,
+      "intensity": 1.15
+    }
+  ],
+  "materials": [
+    {
+      "id": "crate",
+      "texturePath": "assets/textures/pifu.png",
+      "tint": [1.0, 1.0, 1.0]
+    },
+    {
+      "id": "wall",
+      "texturePath": "assets/textures/wall.jpg",
+      "tint": [0.95, 0.95, 0.95]
+    }
+  ],
+  "objects": [
+    {
+      "name": "ground",
+      "geometry": "cube",
+      "materialId": "wall",
+      "position": [0.0, -0.75, 0.0],
+      "scale": [18.0, 1.0, 18.0]
+    },
+    {
+      "name": "tower_a",
+      "geometry": "cube",
+      "materialId": "crate",
+      "position": [-3.0, 1.0, 1.0],
+      "scale": [2.0, 2.0, 2.0]
+    },
+    {
+      "name": "tower_b",
+      "geometry": "cube",
+      "materialId": "crate",
+      "position": [0.5, 1.5, -1.5],
+      "rotationDegrees": [0.0, 35.0, 0.0],
+      "scale": [1.5, 3.0, 1.5]
+    },
+    {
+      "name": "tower_c",
+      "geometry": "cube",
+      "materialId": "crate",
+      "position": [4.0, 0.8, 2.5],
+      "rotationDegrees": [0.0, -20.0, 0.0],
+      "scale": [2.5, 1.6, 2.5]
+    }
+  ],
+  "debug": {
+    "drawAxes": true,
+    "axesLength": 8.0,
+    "drawLightGizmo": true
+  }
+}
