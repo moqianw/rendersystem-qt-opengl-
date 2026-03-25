@@ -42,10 +42,13 @@ qt_add_executable(openglStudy
     src/app/ModelLoader.cpp
     src/app/ModelLoader.hpp
     src/app/RenderBackendTypes.hpp
+    src/app/RenderMath.hpp
     src/app/RenderMeshUtils.cpp
     src/app/RenderMeshUtils.hpp
     src/app/RenderResourceManager.cpp
     src/app/RenderResourceManager.hpp
+    src/app/RenderSceneBackend.cpp
+    src/app/RenderSceneBackend.hpp
     src/app/RenderSceneCompiler.cpp
     src/app/RenderSceneCompiler.hpp
     src/app/RenderViewportHelpers.cpp

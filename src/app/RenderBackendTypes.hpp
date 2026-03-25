@@ -1,15 +1,14 @@
 #pragma once
 
-#include <QMatrix4x4>
 #include <QOpenGLBuffer>
 #include <QOpenGLTexture>
 #include <QOpenGLVertexArrayObject>
 #include <QVector>
-#include <QVector3D>
 
 #include <memory>
 #include <vector>
 
+#include "app/RenderMath.hpp"
 #include "app/SceneConfig.hpp"
 
 namespace renderer {
@@ -37,7 +36,7 @@ struct MeshHandle {
 };
 
 struct MaterialResource {
-    QVector3D tint = QVector3D(1.0f, 1.0f, 1.0f);
+    glm::vec3 tint = glm::vec3(1.0f, 1.0f, 1.0f);
     std::shared_ptr<QOpenGLTexture> texture;
 };
 
@@ -51,8 +50,8 @@ struct ModelPartResource {
 
 struct ModelResource {
     std::vector<std::unique_ptr<ModelPartResource>> parts;
-    QVector3D boundsMin = QVector3D(-0.5f, -0.5f, -0.5f);
-    QVector3D boundsMax = QVector3D(0.5f, 0.5f, 0.5f);
+    glm::vec3 boundsMin = glm::vec3(-0.5f, -0.5f, -0.5f);
+    glm::vec3 boundsMax = glm::vec3(0.5f, 0.5f, 0.5f);
     bool valid = false;
 };
 
@@ -67,17 +66,17 @@ struct RenderItem {
     RenderGeometrySource geometrySource = RenderGeometrySource::Cube;
     MeshHandle* mesh = nullptr;
     MaterialResourcePtr material;
-    QMatrix4x4 modelMatrix;
-    QVector3D localBoundsMin = QVector3D(-0.5f, -0.5f, -0.5f);
-    QVector3D localBoundsMax = QVector3D(0.5f, 0.5f, 0.5f);
+    glm::mat4 modelMatrix = glm::mat4(1.0f);
+    glm::vec3 localBoundsMin = glm::vec3(-0.5f, -0.5f, -0.5f);
+    glm::vec3 localBoundsMax = glm::vec3(0.5f, 0.5f, 0.5f);
 };
 
 struct RenderObjectInstance {
     int objectIndex = -1;
     bool visible = true;
-    QMatrix4x4 worldTransform;
-    QVector3D localBoundsMin = QVector3D(-0.5f, -0.5f, -0.5f);
-    QVector3D localBoundsMax = QVector3D(0.5f, 0.5f, 0.5f);
+    glm::mat4 worldTransform = glm::mat4(1.0f);
+    glm::vec3 localBoundsMin = glm::vec3(-0.5f, -0.5f, -0.5f);
+    glm::vec3 localBoundsMax = glm::vec3(0.5f, 0.5f, 0.5f);
 };
 
 struct CompiledRenderScene {

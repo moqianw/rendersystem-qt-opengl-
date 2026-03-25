@@ -1,5 +1,7 @@
 #include "app/SceneRenderer.hpp"
 
+#include "app/RenderMath.hpp"
+
 #include <QString>
 #include <QtMath>
 #include <QtGlobal>
@@ -95,8 +97,12 @@ void SceneRenderer::render(
             continue;
         }
 
-        program_.setUniformValue(QStringLiteral("uModel").toUtf8().constData(), item.modelMatrix);
-        program_.setUniformValue(QStringLiteral("uMaterial.tint").toUtf8().constData(), item.material->tint);
+        program_.setUniformValue(
+            QStringLiteral("uModel").toUtf8().constData(),
+            rendermath::toQt(item.modelMatrix));
+        program_.setUniformValue(
+            QStringLiteral("uMaterial.tint").toUtf8().constData(),
+            rendermath::toQt(item.material->tint));
 
         if (item.material->texture) {
             item.material->texture->bind(0);

@@ -2,6 +2,7 @@
 
 #include <QElapsedTimer>
 #include <QMatrix4x4>
+#include <QMetaObject>
 #include <QOpenGLFunctions_4_5_Core>
 #include <QOpenGLShaderProgram>
 #include <QOpenGLWidget>
@@ -17,7 +18,7 @@
 #include <vector>
 
 #include "app/RenderBackendTypes.hpp"
-#include "app/RenderResourceManager.hpp"
+#include "app/RenderSceneBackend.hpp"
 #include "app/SceneRenderer.hpp"
 #include "app/SceneConfig.hpp"
 
@@ -195,6 +196,7 @@ private:
     void initializeShaders();
     void initializeGeometry();
     void cleanupOpenGL();
+    void releaseOpenGLResources();
     void rebuildRenderScene(bool reloadResources);
     void destroySceneResources();
     void resetCameraFromScene();
@@ -266,11 +268,12 @@ private:
     float fov_ = 45.0f;
     float nearClip_ = 0.1f;
     float farClip_ = 200.0f;
+    bool openGLResourcesReleased_ = true;
+    QMetaObject::Connection contextDestroyedConnection_;
 
     SceneRenderer sceneRenderer_;
     QOpenGLShaderProgram debugProgram_;
-    RenderResourceManager resourceManager_;
-    CompiledRenderScene compiledScene_;
+    RenderSceneBackend renderSceneBackend_;
     MeshHandle cubeMesh_;
     MeshHandle axesMesh_;
     MeshHandle gridMesh_;

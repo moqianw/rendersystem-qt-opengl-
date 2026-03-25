@@ -1,11 +1,12 @@
 #include "app/RenderSceneCompiler.hpp"
 
+#include "app/RenderMath.hpp"
 #include "app/SceneGraph.hpp"
 
 namespace {
 
-const QVector3D kDefaultBoundsMin(-0.5f, -0.5f, -0.5f);
-const QVector3D kDefaultBoundsMax(0.5f, 0.5f, 0.5f);
+const glm::vec3 kDefaultBoundsMin(-0.5f, -0.5f, -0.5f);
+const glm::vec3 kDefaultBoundsMax(0.5f, 0.5f, 0.5f);
 
 renderer::MaterialResourcePtr resolveObjectMaterial(
     const renderer::RenderObjectConfig& object,
@@ -38,7 +39,7 @@ CompiledRenderScene RenderSceneCompiler::compile(
         RenderObjectInstance instance;
         instance.objectIndex = index;
         instance.visible = object.visible;
-        instance.worldTransform = scenegraph::buildWorldTransform(scene, index);
+        instance.worldTransform = rendermath::toGlm(scenegraph::buildWorldTransform(scene, index));
 
         if (object.geometry == GeometryType::Model && !object.sourcePath.isEmpty() && pathResolver) {
             const auto model = resources.model(pathResolver(object.sourcePath));

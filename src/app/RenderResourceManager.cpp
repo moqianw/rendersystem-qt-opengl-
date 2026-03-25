@@ -9,11 +9,12 @@
 #include <exception>
 
 #include "app/ModelLoader.hpp"
+#include "app/RenderMath.hpp"
 #include "app/RenderMeshUtils.hpp"
 
 namespace {
 
-renderer::MaterialResourcePtr createTextureBackedMaterial(const QImage& image, const QVector3D& tint) {
+renderer::MaterialResourcePtr createTextureBackedMaterial(const QImage& image, const glm::vec3& tint) {
     auto material = std::make_shared<renderer::MaterialResource>();
     material->tint = tint;
     material->texture = std::make_shared<QOpenGLTexture>(image);
@@ -30,7 +31,7 @@ QImage fallbackWhiteImage() {
 }
 
 renderer::MaterialResourcePtr buildFallbackMaterial() {
-    return createTextureBackedMaterial(fallbackWhiteImage(), QVector3D(1.0f, 1.0f, 1.0f));
+    return createTextureBackedMaterial(fallbackWhiteImage(), glm::vec3(1.0f, 1.0f, 1.0f));
 }
 
 }  // namespace
@@ -117,7 +118,7 @@ void RenderResourceManager::rebuildMaterials(
 
         const QString id =
             materialConfig.id.isEmpty() ? QStringLiteral("__default__") : materialConfig.id;
-        materials_.insert(id, createTextureBackedMaterial(image, materialConfig.tint));
+        materials_.insert(id, createTextureBackedMaterial(image, rendermath::toGlm(materialConfig.tint)));
     }
 }
 
@@ -139,8 +140,8 @@ void RenderResourceManager::rebuildModels(
         auto runtime = std::make_shared<ModelResource>();
         try {
             const ModelImportData imported = ModelLoader::importModel(key);
-            runtime->boundsMin = imported.boundsMin;
-            runtime->boundsMax = imported.boundsMax;
+            runtime->boundsMin = rendermath::toGlm(imported.boundsMin);
+            runtime->boundsMax = rendermath::toGlm(imported.boundsMax);
             runtime->parts.reserve(imported.subMeshes.size());
 
             for (const ImportedSubMeshData& subMesh : imported.subMeshes) {

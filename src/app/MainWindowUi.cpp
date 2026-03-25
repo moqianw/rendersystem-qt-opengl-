@@ -165,6 +165,7 @@ void MainWindow::createMenus() {
     panelsMenu->addAction(toolsDock_->toggleViewAction());
 
     auto* toolbar = addToolBar(QStringLiteral("Scene"));
+    toolbar->setObjectName(QStringLiteral("SceneToolBar"));
     toolbar->setMovable(false);
     toolbar->addAction(saveAction);
     toolbar->addAction(reloadAction);

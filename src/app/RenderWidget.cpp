@@ -22,7 +22,6 @@
 #include <limits>
 
 #include "app/RenderMeshUtils.hpp"
-#include "app/RenderSceneCompiler.hpp"
 #include "app/RenderViewportHelpers.hpp"
 #include "app/SceneGraph.hpp"
 
@@ -276,6 +275,9 @@ namespace renderer {
 RenderWidget::RenderWidget(const SceneConfig& scene, QWidget* parent)
     : QOpenGLWidget(parent),
       scene_(scene) {
+    renderSceneBackend_.setPathResolver([this](const QString& path) {
+        return resolvePath(path);
+    });
     scenegraph::ensureObjectIds(&scene_);
     setFocusPolicy(Qt::StrongFocus);
     setMouseTracking(true);
@@ -293,14 +295,15 @@ RenderWidget::RenderWidget(const SceneConfig& scene, QWidget* parent)
 }
 
 RenderWidget::~RenderWidget() {
+    frameTimer_.stop();
+    QObject::disconnect(contextDestroyedConnection_);
+
     if (!context()) {
         return;
     }
 
     makeCurrent();
-    destroySceneResources();
-    sceneRenderer_.cleanup();
-    debugProgram_.removeAllShaders();
+    releaseOpenGLResources();
     doneCurrent();
 }
 
@@ -341,9 +344,7 @@ void RenderWidget::setScene(const SceneConfig& scene, SceneUpdateMode updateMode
         rebuildRenderScene(updateMode == SceneUpdateMode::ReloadResources);
         doneCurrent();
     } else {
-        compiledScene_ = RenderSceneCompiler::compile(scene_, resourceManager_, [this](const QString& path) {
-            return resolvePath(path);
-        });
+        renderSceneBackend_.sync(scene_, updateMode == SceneUpdateMode::ReloadResources);
     }
 
     update();
@@ -451,7 +452,8 @@ void RenderWidget::focusOnSelectedObject() {
 
 void RenderWidget::initializeGL() {
     initializeOpenGLFunctions();
-    connect(
+    QObject::disconnect(contextDestroyedConnection_);
+    contextDestroyedConnection_ = connect(
         context(),
         &QOpenGLContext::aboutToBeDestroyed,
         this,
@@ -467,6 +469,7 @@ void RenderWidget::initializeGL() {
     destroySceneResources();
     initializeGeometry();
     rebuildRenderScene(true);
+    openGLResourcesReleased_ = false;
 }
 
 void RenderWidget::paintGL() {
@@ -476,7 +479,7 @@ void RenderWidget::paintGL() {
 
     const QMatrix4x4 view = buildViewMatrix();
     const QMatrix4x4 projection = buildProjectionMatrix();
-    sceneRenderer_.render(compiledScene_, &cubeMesh_, view, projection, cameraPosition_);
+    sceneRenderer_.render(renderSceneBackend_.compiledScene(), &cubeMesh_, view, projection, cameraPosition_);
     renderDebugPass(view, projection);
 
     if (mouseMode_ == MouseMode::BoxSelect) {
@@ -782,6 +785,7 @@ void RenderWidget::mouseMoveEvent(QMouseEvent* event) {
                 }
 
                 object.position = nextPosition;
+                rebuildRenderScene(false);
                 cameraTarget_ = selectionCenter();
                 updateOrbitDistance();
                 emitCameraState();
@@ -806,6 +810,7 @@ void RenderWidget::mouseMoveEvent(QMouseEvent* event) {
                 }
 
                 object.scale = nextScale;
+                rebuildRenderScene(false);
                 emitTransformPreview();
                 update();
             }
@@ -825,6 +830,7 @@ void RenderWidget::mouseMoveEvent(QMouseEvent* event) {
                     : (deltaRotation * startRotation);
 
             object.rotationDegrees = composed.normalized().toEulerAngles();
+            rebuildRenderScene(false);
             emitTransformPreview();
             update();
         }
@@ -859,6 +865,7 @@ void RenderWidget::mouseMoveEvent(QMouseEvent* event) {
                 }
 
                 light.position = nextPosition;
+                rebuildRenderScene(false);
                 cameraTarget_ = activeSelectionCenter();
                 updateOrbitDistance();
                 emitCameraState();
@@ -880,6 +887,7 @@ void RenderWidget::mouseMoveEvent(QMouseEvent* event) {
                     : (deltaRotation * startRotation);
             light.direction =
                 composed.normalized().rotatedVector(QVector3D(0.0f, 0.0f, -1.0f)).normalized();
+            rebuildRenderScene(false);
             emitLightTransformPreview();
             update();
         }
@@ -1853,10 +1861,19 @@ void RenderWidget::cleanupOpenGL() {
     }
 
     makeCurrent();
+    releaseOpenGLResources();
+    doneCurrent();
+}
+
+void RenderWidget::releaseOpenGLResources() {
+    if (openGLResourcesReleased_) {
+        return;
+    }
+
     destroySceneResources();
     sceneRenderer_.cleanup();
     debugProgram_.removeAllShaders();
-    doneCurrent();
+    openGLResourcesReleased_ = true;
 }
 
 void RenderWidget::initializeGeometry() {
@@ -1918,17 +1935,12 @@ void RenderWidget::initializeGeometry() {
 }
 
 void RenderWidget::rebuildRenderScene(bool reloadResources) {
-    resourceManager_.sync(scene_, reloadResources, [this](const QString& path) {
-        return resolvePath(path);
-    });
-    compiledScene_ = RenderSceneCompiler::compile(scene_, resourceManager_, [this](const QString& path) {
-        return resolvePath(path);
-    });
+    renderSceneBackend_.sync(scene_, reloadResources);
+    openGLResourcesReleased_ = false;
 }
 
 void RenderWidget::destroySceneResources() {
-    compiledScene_.clear();
-    resourceManager_.clear();
+    renderSceneBackend_.clear();
     rendermesh::destroyMesh(&cubeMesh_);
     rendermesh::destroyMesh(&axesMesh_);
     rendermesh::destroyMesh(&gridMesh_);
@@ -2202,8 +2214,8 @@ QMatrix4x4 RenderWidget::buildProjectionMatrix() const {
 }
 
 QMatrix4x4 RenderWidget::buildObjectModelMatrix(int index) const {
-    if (index >= 0 && index < compiledScene_.objects.size()) {
-        return compiledScene_.objects.at(index).worldTransform;
+    if (index >= 0 && index < renderSceneBackend_.compiledScene().objects.size()) {
+        return renderSceneBackend_.objectWorldTransform(index);
     }
     return scenegraph::buildWorldTransform(scene_, index);
 }
@@ -2285,17 +2297,11 @@ QQuaternion RenderWidget::buildLightRotation(int index) const {
 }
 
 QVector3D RenderWidget::objectLocalBoundsMin(int index) const {
-    if (index < 0 || index >= compiledScene_.objects.size()) {
-        return QVector3D(-0.5f, -0.5f, -0.5f);
-    }
-    return compiledScene_.objects.at(index).localBoundsMin;
+    return renderSceneBackend_.objectLocalBoundsMin(index);
 }
 
 QVector3D RenderWidget::objectLocalBoundsMax(int index) const {
-    if (index < 0 || index >= compiledScene_.objects.size()) {
-        return QVector3D(0.5f, 0.5f, 0.5f);
-    }
-    return compiledScene_.objects.at(index).localBoundsMax;
+    return renderSceneBackend_.objectLocalBoundsMax(index);
 }
 
 QVector3D RenderWidget::objectCenter(int index) const {
