@@ -21,13 +21,14 @@
 #include <cstddef>
 #include <limits>
 
+#include "app/RenderMeshUtils.hpp"
+#include "app/RenderSceneCompiler.hpp"
+#include "app/RenderViewportHelpers.hpp"
 #include "app/SceneGraph.hpp"
 
 namespace {
 
 constexpr float kPitchLimit = 89.0f;
-constexpr float kLightMarkerScale = 0.25f;
-constexpr int kMaxLights = 16;
 constexpr float kPanSensitivity = 0.0025f;
 constexpr float kZoomSpeed = 0.12f;
 constexpr float kMinOrbitDistance = 1.0f;
@@ -47,14 +48,15 @@ constexpr int kTranslatePlaneIndexCount = 8;
 constexpr float kTranslatePlaneInner = 0.24f;
 constexpr float kTranslatePlaneOuter = 0.46f;
 constexpr float kPlaneGizmoPickPadding = 8.0f;
+constexpr int kMinimumGridRingCount = 64;
 
-renderer::RenderWidget::Vertex makeVertex(
+renderer::RenderVertex makeVertex(
     const QVector3D& position,
     const QVector3D& normal,
     float u,
     float v,
     const QVector3D& color = QVector3D(1.0f, 1.0f, 1.0f)) {
-    return renderer::RenderWidget::Vertex{
+    return renderer::RenderVertex{
         position.x(),
         position.y(),
         position.z(),
@@ -85,6 +87,10 @@ QVector3D normalizedLightDirection(const renderer::LightConfig& light) {
         direction = QVector3D(-0.45f, -1.0f, -0.3f);
     }
     return direction.normalized();
+}
+
+QQuaternion lightOrientationFromDirection(const QVector3D& direction) {
+    return QQuaternion::rotationTo(QVector3D(0.0f, 0.0f, -1.0f), direction.normalized()).normalized();
 }
 
 float sanitizedLightRange(const renderer::LightConfig& light) {
@@ -293,7 +299,7 @@ RenderWidget::~RenderWidget() {
 
     makeCurrent();
     destroySceneResources();
-    sceneProgram_.removeAllShaders();
+    sceneRenderer_.cleanup();
     debugProgram_.removeAllShaders();
     doneCurrent();
 }
@@ -313,6 +319,9 @@ void RenderWidget::setScene(const SceneConfig& scene, SceneUpdateMode updateMode
     if (!selectedObjectIndices_.contains(selectedObjectIndex_)) {
         selectedObjectIndex_ = selectedObjectIndices_.isEmpty() ? -1 : selectedObjectIndices_.constLast();
     }
+    if (selectedLightIndex_ < 0 || selectedLightIndex_ >= scene_.lights.size()) {
+        selectedLightIndex_ = -1;
+    }
 
     if (resetCamera) {
         resetCameraFromScene();
@@ -323,12 +332,18 @@ void RenderWidget::setScene(const SceneConfig& scene, SceneUpdateMode updateMode
 
     syncMouseCapture();
 
-    if (context() && updateMode == SceneUpdateMode::ReloadResources) {
+    if (context()) {
         makeCurrent();
-        destroySceneResources();
-        initializeTextures();
-        initializeGeometry();
+        if (updateMode == SceneUpdateMode::ReloadResources) {
+            destroySceneResources();
+            initializeGeometry();
+        }
+        rebuildRenderScene(updateMode == SceneUpdateMode::ReloadResources);
         doneCurrent();
+    } else {
+        compiledScene_ = RenderSceneCompiler::compile(scene_, resourceManager_, [this](const QString& path) {
+            return resolvePath(path);
+        });
     }
 
     update();
@@ -342,12 +357,30 @@ void RenderWidget::setSelectedObjectIndex(int index) {
     setSelection(index >= 0 ? QVector<int>{index} : QVector<int>{}, index);
 }
 
+void RenderWidget::setSelectedLightIndex(int index) {
+    selectedObjectIndices_.clear();
+    selectedObjectIndex_ = -1;
+    selectedLightIndex_ = index >= 0 && index < scene_.lights.size() ? index : -1;
+    activeGizmoHandle_ = GizmoHandle::None;
+    transformInteractionActive_ = false;
+    if (selectedLightIndex_ >= 0) {
+        cameraTarget_ = activeSelectionCenter();
+        updateOrbitDistance();
+        emitCameraState();
+    }
+    update();
+}
+
 QVector<int> RenderWidget::selectedObjectIndices() const {
     return selectedObjectIndices_;
 }
 
 int RenderWidget::selectedObjectIndex() const {
     return selectedObjectIndex_;
+}
+
+int RenderWidget::selectedLightIndex() const {
+    return selectedLightIndex_;
 }
 
 void RenderWidget::setTransformMode(TransformMode mode) {
@@ -403,13 +436,13 @@ void RenderWidget::resetCamera() {
 }
 
 void RenderWidget::focusOnSelectedObject() {
-    if (selectedObjectIndex_ < 0 || selectedObjectIndex_ >= scene_.objects.size()) {
+    if (!hasActiveSelection()) {
         return;
     }
 
-    cameraTarget_ = selectionCenter();
+    cameraTarget_ = activeSelectionCenter();
     const float halfFovRadians = qDegreesToRadians(fov_) * 0.5f;
-    const float radius = qMax(0.75f, selectionRadius());
+    const float radius = qMax(0.75f, activeSelectionRadius());
     orbitDistance_ = qMax(kMinOrbitDistance, (radius / std::tan(halfFovRadians)) * 1.8f);
     cameraPosition_ = cameraTarget_ - cameraFront_ * orbitDistance_;
     emitCameraState();
@@ -432,8 +465,8 @@ void RenderWidget::initializeGL() {
 
     initializeShaders();
     destroySceneResources();
-    initializeTextures();
     initializeGeometry();
+    rebuildRenderScene(true);
 }
 
 void RenderWidget::paintGL() {
@@ -443,276 +476,8 @@ void RenderWidget::paintGL() {
 
     const QMatrix4x4 view = buildViewMatrix();
     const QMatrix4x4 projection = buildProjectionMatrix();
-
-    sceneProgram_.bind();
-    sceneProgram_.setUniformValue("uView", view);
-    sceneProgram_.setUniformValue("uProjection", projection);
-    sceneProgram_.setUniformValue("uViewPos", cameraPosition_);
-    const int lightCount = qMin(scene_.lights.size(), kMaxLights);
-    sceneProgram_.setUniformValue("uLightCount", lightCount);
-    for (int lightIndex = 0; lightIndex < lightCount; ++lightIndex) {
-        const LightConfig& light = scene_.lights.at(lightIndex);
-        const QString uniformPrefix = QStringLiteral("uLights[%1].").arg(lightIndex);
-        sceneProgram_.setUniformValue((uniformPrefix + QStringLiteral("type")).toUtf8().constData(), static_cast<int>(light.type));
-        sceneProgram_.setUniformValue((uniformPrefix + QStringLiteral("position")).toUtf8().constData(), light.position);
-        sceneProgram_.setUniformValue(
-            (uniformPrefix + QStringLiteral("direction")).toUtf8().constData(),
-            normalizedLightDirection(light));
-        sceneProgram_.setUniformValue((uniformPrefix + QStringLiteral("color")).toUtf8().constData(), light.color);
-        sceneProgram_.setUniformValue(
-            (uniformPrefix + QStringLiteral("ambientStrength")).toUtf8().constData(),
-            light.ambientStrength);
-        sceneProgram_.setUniformValue((uniformPrefix + QStringLiteral("intensity")).toUtf8().constData(), light.intensity);
-        sceneProgram_.setUniformValue((uniformPrefix + QStringLiteral("range")).toUtf8().constData(), sanitizedLightRange(light));
-        sceneProgram_.setUniformValue(
-            (uniformPrefix + QStringLiteral("innerConeCos")).toUtf8().constData(),
-            std::cos(qDegreesToRadians(sanitizedInnerConeDegrees(light))));
-        sceneProgram_.setUniformValue(
-            (uniformPrefix + QStringLiteral("outerConeCos")).toUtf8().constData(),
-            std::cos(qDegreesToRadians(sanitizedOuterConeDegrees(light))));
-    }
-    sceneProgram_.setUniformValue("uMaterial.diffuseMap", 0);
-
-    for (int index = 0; index < scene_.objects.size(); ++index) {
-        const RenderObjectConfig& object = scene_.objects.at(index);
-        if (!object.visible) {
-            continue;
-        }
-
-        const QMatrix4x4 modelMatrix = buildObjectModelMatrix(index);
-        sceneProgram_.setUniformValue("uModel", modelMatrix);
-
-        if (object.geometry == GeometryType::Cube) {
-            MaterialRuntime& material = requireMaterial(object.materialId);
-            sceneProgram_.setUniformValue("uMaterial.tint", material.tint);
-            if (material.texture) {
-                material.texture->bind(0);
-            }
-            cubeMesh_.vao.bind();
-            glDrawElements(
-                cubeMesh_.primitiveType,
-                cubeMesh_.indexCount,
-                GL_UNSIGNED_INT,
-                nullptr);
-            cubeMesh_.vao.release();
-            if (material.texture) {
-                material.texture->release();
-            }
-            continue;
-        }
-
-        if (object.geometry != GeometryType::Model) {
-            continue;
-        }
-
-        const QString key = resolvePath(object.sourcePath);
-        const auto it = modelMeshes_.find(key);
-        if (it == modelMeshes_.end() || !it.value() || !it.value()->valid) {
-            continue;
-        }
-
-        const bool hasOverrideMaterial = !object.materialId.isEmpty();
-        for (const auto& part : it.value()->parts) {
-            if (!part || !part->valid || part->mesh.indexCount <= 0) {
-                continue;
-            }
-
-            const QString materialId = hasOverrideMaterial
-                ? object.materialId
-                : (part->materialSlot >= 0 && part->materialSlot < object.materialIds.size()
-                    ? object.materialIds.at(part->materialSlot)
-                    : QString());
-            MaterialRuntime& material = requireMaterial(materialId);
-            sceneProgram_.setUniformValue("uMaterial.tint", material.tint);
-
-            if (material.texture) {
-                material.texture->bind(0);
-            }
-            part->mesh.vao.bind();
-            glDrawElements(
-                part->mesh.primitiveType,
-                part->mesh.indexCount,
-                GL_UNSIGNED_INT,
-                nullptr);
-            part->mesh.vao.release();
-            if (material.texture) {
-                material.texture->release();
-            }
-        }
-    }
-    sceneProgram_.release();
-
-    const bool hasSelection = !selectedObjectIndices_.isEmpty();
-    if (!scene_.debug.drawGrid && !scene_.debug.drawAxes && !scene_.debug.drawLightGizmo && !hasSelection) {
-        if (mouseMode_ == MouseMode::BoxSelect) {
-            QPainter painter(this);
-            painter.setRenderHint(QPainter::Antialiasing, false);
-            const QRect rect = normalizedSelectionRect();
-            painter.fillRect(rect, QColor(70, 140, 220, 45));
-            painter.setPen(QPen(QColor(70, 140, 220), 1.5));
-            painter.drawRect(rect);
-        }
-        return;
-    }
-
-    debugProgram_.bind();
-    debugProgram_.setUniformValue("uView", view);
-    debugProgram_.setUniformValue("uProjection", projection);
-
-    if (scene_.debug.drawGrid) {
-        QMatrix4x4 gridModel;
-        debugProgram_.setUniformValue("uModel", gridModel);
-        debugProgram_.setUniformValue("uColorTint", QVector3D(1.0f, 1.0f, 1.0f));
-
-        gridMesh_.vao.bind();
-        glDrawElements(
-            gridMesh_.primitiveType,
-            gridMesh_.indexCount,
-            GL_UNSIGNED_INT,
-            nullptr);
-        gridMesh_.vao.release();
-    }
-
-    if (scene_.debug.drawAxes) {
-        QMatrix4x4 axesModel;
-        debugProgram_.setUniformValue("uModel", axesModel);
-        debugProgram_.setUniformValue("uColorTint", QVector3D(1.0f, 1.0f, 1.0f));
-
-        axesMesh_.vao.bind();
-        glDrawElements(
-            axesMesh_.primitiveType,
-            axesMesh_.indexCount,
-            GL_UNSIGNED_INT,
-            nullptr);
-        axesMesh_.vao.release();
-    }
-
-    if (scene_.debug.drawLightGizmo) {
-        for (const LightConfig& light : scene_.lights) {
-            QMatrix4x4 lightModel;
-            lightModel.translate(light.position);
-            const float markerScale = light.type == LightType::Directional
-                ? (kLightMarkerScale * 1.35f)
-                : (light.type == LightType::Spot ? (kLightMarkerScale * 1.15f) : kLightMarkerScale);
-            lightModel.scale(markerScale);
-            debugProgram_.setUniformValue("uModel", lightModel);
-            debugProgram_.setUniformValue("uColorTint", light.color);
-
-            cubeMesh_.vao.bind();
-            glDrawElements(
-                cubeMesh_.primitiveType,
-                cubeMesh_.indexCount,
-                GL_UNSIGNED_INT,
-                nullptr);
-            cubeMesh_.vao.release();
-        }
-    }
-
-    if (hasSelection) {
-        glDisable(GL_DEPTH_TEST);
-        glDisable(GL_CULL_FACE);
-
-        for (int index : selectedObjectIndices_) {
-            if (index < 0 || index >= scene_.objects.size() || !scene_.objects.at(index).visible) {
-                continue;
-            }
-
-            debugProgram_.setUniformValue(
-                "uModel",
-                buildSelectionModelMatrix(index, index == selectedObjectIndex_ ? 1.06f : 1.03f));
-            debugProgram_.setUniformValue(
-                "uColorTint",
-                index == selectedObjectIndex_
-                    ? QVector3D(1.15f, 0.82f, 0.22f)
-                    : QVector3D(0.42f, 0.75f, 1.15f));
-            selectionMesh_.vao.bind();
-            glDrawElements(
-                selectionMesh_.primitiveType,
-                selectionMesh_.indexCount,
-                GL_UNSIGNED_INT,
-                nullptr);
-            selectionMesh_.vao.release();
-        }
-
-        if (selectedObjectIndex_ >= 0 && selectedObjectIndex_ < scene_.objects.size()) {
-            debugProgram_.setUniformValue("uModel", buildGizmoModelMatrix());
-
-            if (transformMode_ == TransformMode::Translate) {
-                debugProgram_.setUniformValue("uColorTint", QVector3D(1.0f, 1.0f, 1.0f));
-                translateAxisGizmoMesh_.vao.bind();
-                glDrawElements(
-                    translateAxisGizmoMesh_.primitiveType,
-                    translateAxisGizmoMesh_.indexCount,
-                    GL_UNSIGNED_INT,
-                    nullptr);
-                translateAxisGizmoMesh_.vao.release();
-
-                translatePlaneGizmoMesh_.vao.bind();
-                glDrawElements(
-                    translatePlaneGizmoMesh_.primitiveType,
-                    translatePlaneGizmoMesh_.indexCount,
-                    GL_UNSIGNED_INT,
-                    nullptr);
-                translatePlaneGizmoMesh_.vao.release();
-
-                if (activeGizmoHandle_ != GizmoHandle::None) {
-                    const QVector3D highlightTint =
-                        activeGizmoHandle_ == GizmoHandle::X || activeGizmoHandle_ == GizmoHandle::XY || activeGizmoHandle_ == GizmoHandle::XZ
-                            ? QVector3D(2.2f, 0.8f, 0.8f)
-                        : activeGizmoHandle_ == GizmoHandle::Y || activeGizmoHandle_ == GizmoHandle::YZ
-                            ? QVector3D(0.8f, 2.2f, 0.8f)
-                            : QVector3D(0.8f, 1.2f, 2.2f);
-                    debugProgram_.setUniformValue("uColorTint", highlightTint);
-                    if (isPlaneHandle(activeGizmoHandle_)) {
-                        translatePlaneGizmoMesh_.vao.bind();
-                        glDrawElements(
-                            translatePlaneGizmoMesh_.primitiveType,
-                            kTranslatePlaneIndexCount,
-                            GL_UNSIGNED_INT,
-                            reinterpret_cast<const void*>(static_cast<size_t>(translatePlaneStartIndex(activeGizmoHandle_)) * sizeof(quint32)));
-                        translatePlaneGizmoMesh_.vao.release();
-                    } else {
-                        translateAxisGizmoMesh_.vao.bind();
-                        glDrawElements(
-                            translateAxisGizmoMesh_.primitiveType,
-                            gizmoAxisIndexCount(transformMode_),
-                            GL_UNSIGNED_INT,
-                            reinterpret_cast<const void*>(static_cast<size_t>(gizmoAxisStartIndex(transformMode_, activeGizmoHandle_)) * sizeof(quint32)));
-                        translateAxisGizmoMesh_.vao.release();
-                    }
-                }
-            } else {
-                MeshHandle* gizmoMesh = transformMode_ == TransformMode::Rotate ? &rotationGizmoMesh_ : &scaleGizmoMesh_;
-                debugProgram_.setUniformValue("uColorTint", QVector3D(1.0f, 1.0f, 1.0f));
-                gizmoMesh->vao.bind();
-                glDrawElements(
-                    gizmoMesh->primitiveType,
-                    gizmoMesh->indexCount,
-                    GL_UNSIGNED_INT,
-                    nullptr);
-
-                if (activeGizmoHandle_ != GizmoHandle::None) {
-                    const QVector3D highlightTint =
-                        activeGizmoHandle_ == GizmoHandle::X ? QVector3D(2.2f, 0.8f, 0.8f)
-                        : activeGizmoHandle_ == GizmoHandle::Y ? QVector3D(0.8f, 2.2f, 0.8f)
-                                                               : QVector3D(0.8f, 1.2f, 2.2f);
-                    debugProgram_.setUniformValue("uColorTint", highlightTint);
-                    glDrawElements(
-                        gizmoMesh->primitiveType,
-                        gizmoAxisIndexCount(transformMode_),
-                        GL_UNSIGNED_INT,
-                        reinterpret_cast<const void*>(static_cast<size_t>(gizmoAxisStartIndex(transformMode_, activeGizmoHandle_)) * sizeof(quint32)));
-                }
-
-                gizmoMesh->vao.release();
-            }
-        }
-
-        glEnable(GL_CULL_FACE);
-        glEnable(GL_DEPTH_TEST);
-    }
-
-    debugProgram_.release();
+    sceneRenderer_.render(compiledScene_, &cubeMesh_, view, projection, cameraPosition_);
+    renderDebugPass(view, projection);
 
     if (mouseMode_ == MouseMode::BoxSelect) {
         QPainter painter(this);
@@ -823,15 +588,22 @@ void RenderWidget::mousePressEvent(QMouseEvent* event) {
 
     if (event->button() == Qt::LeftButton) {
         const GizmoHandle pickedHandle = pickGizmoHandle(event->position());
-        if (pickedHandle != GizmoHandle::None && selectedObjectIndex_ >= 0) {
-            const RenderObjectConfig& object = scene_.objects.at(selectedObjectIndex_);
+        if (pickedHandle != GizmoHandle::None && canRenderActiveGizmo()) {
             bool readyToTransform = false;
 
             gizmoDragStartMousePosition_ = event->position().toPoint();
-            gizmoDragStartPosition_ = object.position;
-            gizmoDragStartRotationDegrees_ = object.rotationDegrees;
-            gizmoDragStartScale_ = object.scale;
             activeGizmoHandle_ = pickedHandle;
+
+            if (activeTransformTarget() == TransformTarget::Object) {
+                const RenderObjectConfig& object = scene_.objects.at(selectedObjectIndex_);
+                gizmoDragStartPosition_ = object.position;
+                gizmoDragStartRotationDegrees_ = object.rotationDegrees;
+                gizmoDragStartScale_ = object.scale;
+            } else if (activeTransformTarget() == TransformTarget::Light) {
+                const LightConfig& light = scene_.lights.at(selectedLightIndex_);
+                gizmoDragStartPosition_ = light.position;
+                gizmoDragStartLightDirection_ = normalizedLightDirection(light);
+            }
 
             if (transformMode_ == TransformMode::Translate && isPlaneHandle(pickedHandle)) {
                 const Ray ray = buildPickRay(event->position());
@@ -851,7 +623,11 @@ void RenderWidget::mousePressEvent(QMouseEvent* event) {
                     : transformMode_ == TransformMode::Rotate   ? MouseMode::Rotate
                                                                 : MouseMode::Scale;
                 setCursor(Qt::SizeAllCursor);
-                emit objectTransformInteractionStarted(selectedObjectIndex_, transformMode_);
+                if (activeTransformTarget() == TransformTarget::Object) {
+                    emit objectTransformInteractionStarted(selectedObjectIndex_, transformMode_);
+                } else if (activeTransformTarget() == TransformTarget::Light) {
+                    emit lightTransformInteractionStarted(selectedLightIndex_, transformMode_);
+                }
                 event->accept();
                 return;
             }
@@ -900,6 +676,15 @@ void RenderWidget::mouseReleaseEvent(QMouseEvent* event) {
                 object.position,
                 object.rotationDegrees,
                 object.scale,
+                transformMode_);
+        } else if (transformInteractionActive_ &&
+            selectedLightIndex_ >= 0 &&
+            selectedLightIndex_ < scene_.lights.size()) {
+            const LightConfig& light = scene_.lights.at(selectedLightIndex_);
+            emit lightTransformInteractionFinished(
+                selectedLightIndex_,
+                light.position,
+                normalizedLightDirection(light),
                 transformMode_);
         }
         syncMouseCapture();
@@ -961,7 +746,9 @@ void RenderWidget::mouseMoveEvent(QMouseEvent* event) {
     } else if (mouseMode_ == MouseMode::BoxSelect) {
         boxSelectionCurrent_ = position;
         update();
-    } else if (selectedObjectIndex_ >= 0 && selectedObjectIndex_ < scene_.objects.size()) {
+    } else if (activeTransformTarget() == TransformTarget::Object &&
+        selectedObjectIndex_ >= 0 &&
+        selectedObjectIndex_ < scene_.objects.size()) {
         RenderObjectConfig& object = scene_.objects[selectedObjectIndex_];
         const bool useSnap = snapEnabled_ || event->modifiers().testFlag(Qt::ShiftModifier);
 
@@ -1041,6 +828,61 @@ void RenderWidget::mouseMoveEvent(QMouseEvent* event) {
             emitTransformPreview();
             update();
         }
+    } else if (activeTransformTarget() == TransformTarget::Light &&
+        selectedLightIndex_ >= 0 &&
+        selectedLightIndex_ < scene_.lights.size()) {
+        LightConfig& light = scene_.lights[selectedLightIndex_];
+        const bool useSnap = snapEnabled_ || event->modifiers().testFlag(Qt::ShiftModifier);
+
+        if (mouseMode_ == MouseMode::Translate) {
+            const Ray ray = buildPickRay(event->position());
+            QVector3D nextPosition = gizmoDragStartPosition_;
+            bool updated = false;
+            if (isPlaneHandle(activeGizmoHandle_)) {
+                QVector3D worldPoint;
+                if (solvePlaneDragPoint(ray, activeGizmoHandle_, &worldPoint)) {
+                    nextPosition = gizmoDragStartPosition_ + (worldPoint - gizmoDragStartWorldPoint_);
+                    updated = true;
+                }
+            } else {
+                float axisParameter = 0.0f;
+                if (solveAxisDragParameter(ray, activeGizmoHandle_, &axisParameter)) {
+                    const QVector3D worldDelta = gizmoAxisDirection(activeGizmoHandle_) * (axisParameter - gizmoDragStartParameter_);
+                    nextPosition = gizmoDragStartPosition_ + worldDelta;
+                    updated = true;
+                }
+            }
+
+            if (updated) {
+                if (useSnap) {
+                    nextPosition = snapPositionForHandle(nextPosition, activeGizmoHandle_, linearSnapStep());
+                }
+
+                light.position = nextPosition;
+                cameraTarget_ = activeSelectionCenter();
+                updateOrbitDistance();
+                emitCameraState();
+                emitLightTransformPreview();
+                update();
+            }
+        } else if (mouseMode_ == MouseMode::Rotate && light.type != LightType::Point) {
+            float nextAngle = rotationDragDegrees(position);
+            if (useSnap) {
+                nextAngle = snapScalar(nextAngle, rotateSnapStepDegrees_);
+            }
+
+            const QQuaternion startRotation = lightOrientationFromDirection(gizmoDragStartLightDirection_);
+            const QQuaternion deltaRotation =
+                QQuaternion::fromAxisAndAngle(baseAxisDirection(activeGizmoHandle_), nextAngle);
+            const QQuaternion composed =
+                coordinateSpace_ == CoordinateSpace::Local
+                    ? (startRotation * deltaRotation)
+                    : (deltaRotation * startRotation);
+            light.direction =
+                composed.normalized().rotatedVector(QVector3D(0.0f, 0.0f, -1.0f)).normalized();
+            emitLightTransformPreview();
+            update();
+        }
     }
 
     QOpenGLWidget::mouseMoveEvent(event);
@@ -1054,7 +896,7 @@ void RenderWidget::wheelEvent(QWheelEvent* event) {
     }
 
     const float zoomAmount = qMax(0.5f, orbitDistance_ * kZoomSpeed) * wheelSteps;
-    if (selectedObjectIndex_ >= 0) {
+    if (hasActiveSelection()) {
         orbitDistance_ = qMax(kMinOrbitDistance, orbitDistance_ - zoomAmount);
         cameraPosition_ = cameraTarget_ - cameraFront_ * orbitDistance_;
         emitCameraState();
@@ -1166,6 +1008,7 @@ void RenderWidget::emitCameraState() {
 
 void RenderWidget::applySelection(const QVector<int>& indices, int activeIndex, bool emitSignal) {
     selectedObjectIndices_ = normalizedSelection(indices, activeIndex);
+    selectedLightIndex_ = -1;
     if (selectedObjectIndices_.isEmpty()) {
         selectedObjectIndex_ = -1;
     } else if (activeIndex >= 0 && activeIndex < scene_.objects.size() && selectedObjectIndices_.contains(activeIndex)) {
@@ -1177,7 +1020,7 @@ void RenderWidget::applySelection(const QVector<int>& indices, int activeIndex, 
     activeGizmoHandle_ = GizmoHandle::None;
     transformInteractionActive_ = false;
     if (selectedObjectIndex_ >= 0) {
-        cameraTarget_ = selectionCenter();
+        cameraTarget_ = activeSelectionCenter();
         updateOrbitDistance();
         emitCameraState();
     }
@@ -1205,8 +1048,94 @@ QVector<int> RenderWidget::normalizedSelection(const QVector<int>& indices, int 
     return normalized;
 }
 
+RenderWidget::TransformTarget RenderWidget::activeTransformTarget() const {
+    if (selectedObjectIndex_ >= 0 && selectedObjectIndex_ < scene_.objects.size()) {
+        return TransformTarget::Object;
+    }
+    if (selectedLightIndex_ >= 0 && selectedLightIndex_ < scene_.lights.size()) {
+        return TransformTarget::Light;
+    }
+    return TransformTarget::None;
+}
+
+bool RenderWidget::hasActiveSelection() const {
+    return activeTransformTarget() != TransformTarget::None;
+}
+
+bool RenderWidget::canRenderActiveGizmo() const {
+    if (activeTransformTarget() == TransformTarget::Object) {
+        return true;
+    }
+    if (activeTransformTarget() != TransformTarget::Light) {
+        return false;
+    }
+    if (transformMode_ == TransformMode::Scale) {
+        return false;
+    }
+
+    const LightConfig& light = scene_.lights.at(selectedLightIndex_);
+    return transformMode_ != TransformMode::Rotate || light.type != LightType::Point;
+}
+
+QVector3D RenderWidget::activeSelectionCenter() const {
+    switch (activeTransformTarget()) {
+    case TransformTarget::Object:
+        return selectionCenter();
+    case TransformTarget::Light:
+        return lightCenter(selectedLightIndex_);
+    case TransformTarget::None:
+        break;
+    }
+
+    return cameraPosition_ + cameraFront_ * orbitDistance_;
+}
+
+float RenderWidget::activeSelectionRadius() const {
+    switch (activeTransformTarget()) {
+    case TransformTarget::Object:
+        return selectionRadius();
+    case TransformTarget::Light:
+        return lightRadius(selectedLightIndex_);
+    case TransformTarget::None:
+        break;
+    }
+
+    return 1.0f;
+}
+
+QVector3D RenderWidget::activeGizmoOrigin() const {
+    return activeSelectionCenter();
+}
+
+QQuaternion RenderWidget::activeGizmoOrientation() const {
+    if (coordinateSpace_ != CoordinateSpace::Local) {
+        return QQuaternion();
+    }
+
+    if (activeTransformTarget() == TransformTarget::Object) {
+        return buildWorldRotation(selectedObjectIndex_);
+    }
+    if (activeTransformTarget() == TransformTarget::Light) {
+        return buildLightRotation(selectedLightIndex_);
+    }
+
+    return QQuaternion();
+}
+
 void RenderWidget::pickAt(const QPointF& position, Qt::KeyboardModifiers modifiers) {
-    const int pickedObject = pickObject(position);
+    float objectDistance = std::numeric_limits<float>::max();
+    float lightDistance = std::numeric_limits<float>::max();
+    const int pickedObject = pickObject(position, &objectDistance);
+    const int pickedLight = pickLight(position, &lightDistance);
+    const bool preferLight =
+        pickedLight >= 0 && (pickedObject < 0 || lightDistance <= objectDistance);
+
+    if (preferLight) {
+        applySelection({}, -1, true);
+        emit lightSelectionChanged(pickedLight);
+        return;
+    }
+
     QVector<int> nextSelection = selectedObjectIndices_;
     int activeIndex = selectedObjectIndex_;
 
@@ -1246,7 +1175,7 @@ void RenderWidget::selectInRect(const QRect& rect, Qt::KeyboardModifiers modifie
     applySelection(nextSelection, activeIndex, true);
 }
 
-int RenderWidget::pickObject(const QPointF& position) const {
+int RenderWidget::pickObject(const QPointF& position, float* hitDistance) const {
     const Ray ray = buildPickRay(position);
     int bestIndex = -1;
     float bestDistance = std::numeric_limits<float>::max();
@@ -1264,6 +1193,35 @@ int RenderWidget::pickObject(const QPointF& position) const {
         }
     }
 
+    if (hitDistance) {
+        *hitDistance = bestDistance;
+    }
+    return bestIndex;
+}
+
+int RenderWidget::pickLight(const QPointF& position, float* hitDistance) const {
+    if (!scene_.debug.drawLightGizmo) {
+        if (hitDistance) {
+            *hitDistance = std::numeric_limits<float>::max();
+        }
+        return -1;
+    }
+
+    const Ray ray = buildPickRay(position);
+    int bestIndex = -1;
+    float bestDistance = std::numeric_limits<float>::max();
+
+    for (int index = 0; index < scene_.lights.size(); ++index) {
+        float candidateDistance = 0.0f;
+        if (intersectLight(ray, index, &candidateDistance) && candidateDistance < bestDistance) {
+            bestDistance = candidateDistance;
+            bestIndex = index;
+        }
+    }
+
+    if (hitDistance) {
+        *hitDistance = bestDistance;
+    }
     return bestIndex;
 }
 
@@ -1296,7 +1254,7 @@ QVector<int> RenderWidget::pickObjectsInRect(const QRect& rect) const {
 }
 
 RenderWidget::GizmoHandle RenderWidget::pickGizmoHandle(const QPointF& position) const {
-    if (selectedObjectIndex_ < 0 || selectedObjectIndex_ >= scene_.objects.size()) {
+    if (!canRenderActiveGizmo()) {
         return GizmoHandle::None;
     }
 
@@ -1308,7 +1266,7 @@ RenderWidget::GizmoHandle RenderWidget::pickGizmoHandle(const QPointF& position)
 }
 
 RenderWidget::GizmoHandle RenderWidget::pickLinearGizmoHandle(const QPointF& position) const {
-    const QVector3D origin = objectCenter(selectedObjectIndex_);
+    const QVector3D origin = activeGizmoOrigin();
     const float scale = gizmoScale();
     GizmoHandle bestAxis = GizmoHandle::None;
     float bestDistance = kLinearGizmoPickThresholdPixels;
@@ -1375,7 +1333,7 @@ RenderWidget::GizmoHandle RenderWidget::pickLinearGizmoHandle(const QPointF& pos
 }
 
 RenderWidget::GizmoHandle RenderWidget::pickRotationAxis(const QPointF& position) const {
-    const QVector3D origin = objectCenter(selectedObjectIndex_);
+    const QVector3D origin = activeGizmoOrigin();
     const float radius = gizmoScale();
     GizmoHandle bestAxis = GizmoHandle::None;
     float bestDistance = kRotationGizmoPickThresholdPixels;
@@ -1491,12 +1449,43 @@ bool RenderWidget::intersectObject(
     return true;
 }
 
-bool RenderWidget::solveAxisDragParameter(const Ray& ray, GizmoHandle axis, float* parameter) const {
-    if (axis == GizmoHandle::None || isPlaneHandle(axis) || selectedObjectIndex_ < 0 || selectedObjectIndex_ >= scene_.objects.size()) {
+bool RenderWidget::intersectLight(const Ray& ray, int lightIndex, float* distance) const {
+    if (lightIndex < 0 || lightIndex >= scene_.lights.size()) {
         return false;
     }
 
-    const QVector3D axisOrigin = objectCenter(selectedObjectIndex_);
+    const viewport::LightMarkerStyle markerStyle =
+        viewport::buildLightMarkerStyle(scene_.lights.at(lightIndex), false);
+    bool invertible = false;
+    const QMatrix4x4 model = markerStyle.modelMatrix;
+    const QMatrix4x4 inverseModel = model.inverted(&invertible);
+    if (!invertible) {
+        return false;
+    }
+
+    const QVector3D localOrigin = (inverseModel * QVector4D(ray.origin, 1.0f)).toVector3D();
+    const QVector3D localDirection = (inverseModel * QVector4D(ray.direction, 0.0f)).toVector3D();
+    if (localDirection.lengthSquared() < 1e-8f) {
+        return false;
+    }
+
+    float localDistance = 0.0f;
+    if (!intersectUnitCube(localOrigin, localDirection, &localDistance)) {
+        return false;
+    }
+
+    const QVector3D localHitPoint = localOrigin + (localDirection * localDistance);
+    const QVector3D worldHitPoint = (model * QVector4D(localHitPoint, 1.0f)).toVector3D();
+    *distance = (worldHitPoint - ray.origin).length();
+    return true;
+}
+
+bool RenderWidget::solveAxisDragParameter(const Ray& ray, GizmoHandle axis, float* parameter) const {
+    if (axis == GizmoHandle::None || isPlaneHandle(axis) || activeTransformTarget() == TransformTarget::None) {
+        return false;
+    }
+
+    const QVector3D axisOrigin = activeGizmoOrigin();
     const QVector3D axisDirection = gizmoAxisDirection(axis);
     const QVector3D separation = ray.origin - axisOrigin;
 
@@ -1516,11 +1505,11 @@ bool RenderWidget::solveAxisDragParameter(const Ray& ray, GizmoHandle axis, floa
 }
 
 bool RenderWidget::solvePlaneDragPoint(const Ray& ray, GizmoHandle plane, QVector3D* point) const {
-    if (!point || !isPlaneHandle(plane) || selectedObjectIndex_ < 0 || selectedObjectIndex_ >= scene_.objects.size()) {
+    if (!point || !isPlaneHandle(plane) || activeTransformTarget() == TransformTarget::None) {
         return false;
     }
 
-    const QVector3D planeOrigin = objectCenter(selectedObjectIndex_);
+    const QVector3D planeOrigin = activeGizmoOrigin();
     const QVector3D planeNormal = gizmoPlaneNormal(plane);
     const float denominator = QVector3D::dotProduct(ray.direction, planeNormal);
     if (qAbs(denominator) < 1e-5f) {
@@ -1556,10 +1545,8 @@ QVector3D RenderWidget::baseAxisDirection(GizmoHandle axis) const {
 
 QVector3D RenderWidget::gizmoAxisDirection(GizmoHandle axis) const {
     const QVector3D baseAxis = baseAxisDirection(axis);
-    if (coordinateSpace_ == CoordinateSpace::Local &&
-        selectedObjectIndex_ >= 0 &&
-        selectedObjectIndex_ < scene_.objects.size()) {
-        return buildWorldRotation(selectedObjectIndex_).rotatedVector(baseAxis).normalized();
+    if (coordinateSpace_ == CoordinateSpace::Local && activeTransformTarget() != TransformTarget::None) {
+        return activeGizmoOrientation().rotatedVector(baseAxis).normalized();
     }
 
     return baseAxis;
@@ -1579,7 +1566,7 @@ QVector3D RenderWidget::gizmoPlaneNormal(GizmoHandle plane) const {
 }
 
 float RenderWidget::gizmoScale() const {
-    const float distanceToTarget = (cameraPosition_ - objectCenter(selectedObjectIndex_)).length();
+    const float distanceToTarget = (cameraPosition_ - activeGizmoOrigin()).length();
     return qMax(0.85f, distanceToTarget * kGizmoViewScale);
 }
 
@@ -1636,12 +1623,12 @@ float RenderWidget::rotationDragDegrees(const QPoint& mousePosition) const {
     QPointF screenOrigin;
     QPointF screenAxisPoint;
     QVector3D axisDirection = baseAxisDirection(activeGizmoHandle_);
-    if (coordinateSpace_ == CoordinateSpace::Local) {
-        axisDirection = buildWorldRotation(selectedObjectIndex_).rotatedVector(axisDirection).normalized();
+    if (coordinateSpace_ == CoordinateSpace::Local && activeTransformTarget() != TransformTarget::None) {
+        axisDirection = activeGizmoOrientation().rotatedVector(axisDirection).normalized();
     }
 
-    if (!projectToScreen(objectCenter(selectedObjectIndex_), &screenOrigin) ||
-        !projectToScreen(objectCenter(selectedObjectIndex_) + (axisDirection * gizmoScale()), &screenAxisPoint)) {
+    if (!projectToScreen(activeGizmoOrigin(), &screenOrigin) ||
+        !projectToScreen(activeGizmoOrigin() + (axisDirection * gizmoScale()), &screenAxisPoint)) {
         return static_cast<float>(mousePosition.x() - gizmoDragStartMousePosition_.x()) * kRotateSensitivityDegreesPerPixel;
     }
 
@@ -1669,21 +1656,184 @@ void RenderWidget::emitTransformPreview() {
         object.scale);
 }
 
-void RenderWidget::initializeShaders() {
-    sceneProgram_.removeAllShaders();
-    debugProgram_.removeAllShaders();
-    require(
-        sceneProgram_.addShaderFromSourceFile(
-            QOpenGLShader::Vertex,
-            resolvePath("assets/shaders/scene.vert")),
-        sceneProgram_.log());
-    require(
-        sceneProgram_.addShaderFromSourceFile(
-            QOpenGLShader::Fragment,
-            resolvePath("assets/shaders/scene.frag")),
-        sceneProgram_.log());
-    require(sceneProgram_.link(), sceneProgram_.log());
+void RenderWidget::emitLightTransformPreview() {
+    if (selectedLightIndex_ < 0 || selectedLightIndex_ >= scene_.lights.size()) {
+        return;
+    }
 
+    const LightConfig& light = scene_.lights.at(selectedLightIndex_);
+    emit lightTransformPreview(selectedLightIndex_, light.position, normalizedLightDirection(light));
+}
+
+void RenderWidget::renderGridPass() {
+    debugProgram_.setUniformValue("uModel", buildGridModelMatrix());
+    debugProgram_.setUniformValue("uColorTint", QVector3D(1.0f, 1.0f, 1.0f));
+    gridMesh_.vao.bind();
+    glDrawElements(gridMesh_.primitiveType, gridMesh_.indexCount, GL_UNSIGNED_INT, nullptr);
+    gridMesh_.vao.release();
+}
+
+void RenderWidget::renderLightMarkers() {
+    for (int lightIndex = 0; lightIndex < scene_.lights.size(); ++lightIndex) {
+        const viewport::LightMarkerStyle markerStyle =
+            viewport::buildLightMarkerStyle(scene_.lights.at(lightIndex), lightIndex == selectedLightIndex_);
+        debugProgram_.setUniformValue("uModel", markerStyle.modelMatrix);
+        debugProgram_.setUniformValue("uColorTint", markerStyle.tint);
+
+        cubeMesh_.vao.bind();
+        glDrawElements(cubeMesh_.primitiveType, cubeMesh_.indexCount, GL_UNSIGNED_INT, nullptr);
+        cubeMesh_.vao.release();
+    }
+}
+
+void RenderWidget::renderObjectSelectionPass() {
+    for (int index : selectedObjectIndices_) {
+        if (index < 0 || index >= scene_.objects.size() || !scene_.objects.at(index).visible) {
+            continue;
+        }
+
+        debugProgram_.setUniformValue(
+            "uModel",
+            buildSelectionModelMatrix(index, index == selectedObjectIndex_ ? 1.06f : 1.03f));
+        debugProgram_.setUniformValue(
+            "uColorTint",
+            index == selectedObjectIndex_
+                ? QVector3D(1.15f, 0.82f, 0.22f)
+                : QVector3D(0.42f, 0.75f, 1.15f));
+        selectionMesh_.vao.bind();
+        glDrawElements(selectionMesh_.primitiveType, selectionMesh_.indexCount, GL_UNSIGNED_INT, nullptr);
+        selectionMesh_.vao.release();
+    }
+}
+
+void RenderWidget::renderActiveGizmoPass() {
+    if (!canRenderActiveGizmo()) {
+        return;
+    }
+
+    debugProgram_.setUniformValue("uModel", buildGizmoModelMatrix());
+    if (transformMode_ == TransformMode::Translate) {
+        debugProgram_.setUniformValue("uColorTint", QVector3D(1.0f, 1.0f, 1.0f));
+        translateAxisGizmoMesh_.vao.bind();
+        glDrawElements(
+            translateAxisGizmoMesh_.primitiveType,
+            translateAxisGizmoMesh_.indexCount,
+            GL_UNSIGNED_INT,
+            nullptr);
+        translateAxisGizmoMesh_.vao.release();
+
+        translatePlaneGizmoMesh_.vao.bind();
+        glDrawElements(
+            translatePlaneGizmoMesh_.primitiveType,
+            translatePlaneGizmoMesh_.indexCount,
+            GL_UNSIGNED_INT,
+            nullptr);
+        translatePlaneGizmoMesh_.vao.release();
+
+        if (activeGizmoHandle_ != GizmoHandle::None) {
+            const QVector3D highlightTint =
+                activeGizmoHandle_ == GizmoHandle::X || activeGizmoHandle_ == GizmoHandle::XY || activeGizmoHandle_ == GizmoHandle::XZ
+                    ? QVector3D(2.2f, 0.8f, 0.8f)
+                : activeGizmoHandle_ == GizmoHandle::Y || activeGizmoHandle_ == GizmoHandle::YZ
+                    ? QVector3D(0.8f, 2.2f, 0.8f)
+                    : QVector3D(0.8f, 1.2f, 2.2f);
+            debugProgram_.setUniformValue("uColorTint", highlightTint);
+            if (isPlaneHandle(activeGizmoHandle_)) {
+                translatePlaneGizmoMesh_.vao.bind();
+                glDrawElements(
+                    translatePlaneGizmoMesh_.primitiveType,
+                    kTranslatePlaneIndexCount,
+                    GL_UNSIGNED_INT,
+                    reinterpret_cast<const void*>(static_cast<size_t>(translatePlaneStartIndex(activeGizmoHandle_)) * sizeof(quint32)));
+                translatePlaneGizmoMesh_.vao.release();
+            } else {
+                translateAxisGizmoMesh_.vao.bind();
+                glDrawElements(
+                    translateAxisGizmoMesh_.primitiveType,
+                    gizmoAxisIndexCount(transformMode_),
+                    GL_UNSIGNED_INT,
+                    reinterpret_cast<const void*>(static_cast<size_t>(gizmoAxisStartIndex(transformMode_, activeGizmoHandle_)) * sizeof(quint32)));
+                translateAxisGizmoMesh_.vao.release();
+            }
+        }
+        return;
+    }
+
+    MeshHandle* gizmoMesh = transformMode_ == TransformMode::Rotate ? &rotationGizmoMesh_ : &scaleGizmoMesh_;
+    debugProgram_.setUniformValue("uColorTint", QVector3D(1.0f, 1.0f, 1.0f));
+    gizmoMesh->vao.bind();
+    glDrawElements(gizmoMesh->primitiveType, gizmoMesh->indexCount, GL_UNSIGNED_INT, nullptr);
+
+    if (activeGizmoHandle_ != GizmoHandle::None) {
+        const QVector3D highlightTint =
+            activeGizmoHandle_ == GizmoHandle::X ? QVector3D(2.2f, 0.8f, 0.8f)
+            : activeGizmoHandle_ == GizmoHandle::Y ? QVector3D(0.8f, 2.2f, 0.8f)
+                                                   : QVector3D(0.8f, 1.2f, 2.2f);
+        debugProgram_.setUniformValue("uColorTint", highlightTint);
+        glDrawElements(
+            gizmoMesh->primitiveType,
+            gizmoAxisIndexCount(transformMode_),
+            GL_UNSIGNED_INT,
+            reinterpret_cast<const void*>(static_cast<size_t>(gizmoAxisStartIndex(transformMode_, activeGizmoHandle_)) * sizeof(quint32)));
+    }
+
+    gizmoMesh->vao.release();
+}
+
+void RenderWidget::renderDebugPass(const QMatrix4x4& view, const QMatrix4x4& projection) {
+    const viewport::DebugRenderPlan renderPlan = viewport::buildDebugRenderPlan(
+        scene_.debug,
+        !selectedObjectIndices_.isEmpty(),
+        selectedLightIndex_ >= 0,
+        canRenderActiveGizmo());
+    if (!renderPlan.hasAnyPass()) {
+        return;
+    }
+
+    debugProgram_.bind();
+    debugProgram_.setUniformValue("uView", view);
+    debugProgram_.setUniformValue("uProjection", projection);
+
+    if (renderPlan.drawGrid) {
+        renderGridPass();
+    }
+
+    if (renderPlan.drawAxes) {
+        QMatrix4x4 axesModel;
+        debugProgram_.setUniformValue("uModel", axesModel);
+        debugProgram_.setUniformValue("uColorTint", QVector3D(1.0f, 1.0f, 1.0f));
+        axesMesh_.vao.bind();
+        glDrawElements(axesMesh_.primitiveType, axesMesh_.indexCount, GL_UNSIGNED_INT, nullptr);
+        axesMesh_.vao.release();
+    }
+
+    if (renderPlan.drawLightMarkers) {
+        renderLightMarkers();
+    }
+
+    if (renderPlan.requiresOverlayPass()) {
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_CULL_FACE);
+        if (renderPlan.drawObjectSelection) {
+            renderObjectSelectionPass();
+        }
+        if (renderPlan.drawGizmo) {
+            renderActiveGizmoPass();
+        }
+        glEnable(GL_CULL_FACE);
+        glEnable(GL_DEPTH_TEST);
+    }
+
+    debugProgram_.release();
+}
+
+void RenderWidget::initializeShaders() {
+    sceneRenderer_.cleanup();
+    sceneRenderer_.initialize([this](const QString& path) {
+        return resolvePath(path);
+    });
+
+    debugProgram_.removeAllShaders();
     require(
         debugProgram_.addShaderFromSourceFile(
             QOpenGLShader::Vertex,
@@ -1704,144 +1854,89 @@ void RenderWidget::cleanupOpenGL() {
 
     makeCurrent();
     destroySceneResources();
-    sceneProgram_.removeAllShaders();
+    sceneRenderer_.cleanup();
     debugProgram_.removeAllShaders();
     doneCurrent();
 }
 
-void RenderWidget::initializeTextures() {
-    QImage whiteImage(1, 1, QImage::Format_RGBA8888);
-    whiteImage.fill(Qt::white);
-
-    MaterialRuntime fallback;
-    fallback.texture = std::make_shared<QOpenGLTexture>(whiteImage);
-    fallback.texture->setWrapMode(QOpenGLTexture::Repeat);
-    fallback.texture->setMinMagFilters(QOpenGLTexture::LinearMipMapLinear, QOpenGLTexture::Linear);
-    fallback.texture->generateMipMaps();
-    materials_.insert(QStringLiteral("__default__"), fallback);
-
-    for (const MaterialConfig& material : scene_.materials) {
-        MaterialRuntime runtime;
-        runtime.tint = material.tint;
-
-        QImage image;
-        if (!material.embeddedTextureBase64.isEmpty()) {
-            const QByteArray encoded = QByteArray::fromBase64(material.embeddedTextureBase64.toUtf8());
-            image.loadFromData(encoded);
-        } else if (!material.texturePath.isEmpty()) {
-            image = QImage(resolvePath(material.texturePath));
-        }
-        if (!image.isNull() && material.flipVertically) {
-            image = image.mirrored();
-        }
-        if (image.isNull()) {
-            image = whiteImage;
-        } else {
-            image = image.convertToFormat(QImage::Format_RGBA8888);
-        }
-
-        runtime.texture = std::make_shared<QOpenGLTexture>(image);
-        runtime.texture->setWrapMode(QOpenGLTexture::Repeat);
-        runtime.texture->setMinMagFilters(QOpenGLTexture::LinearMipMapLinear, QOpenGLTexture::Linear);
-        runtime.texture->generateMipMaps();
-
-        const QString id = material.id.isEmpty() ? QStringLiteral("__default__") : material.id;
-        materials_.insert(id, runtime);
-    }
-}
-
 void RenderWidget::initializeGeometry() {
-    uploadMesh(cubeMesh_, createCubeVertices(), createCubeIndices(), GL_TRIANGLES);
+    rendermesh::uploadMesh(&cubeMesh_, createCubeVertices(), createCubeIndices(), GL_TRIANGLES);
 
-    const std::vector<Vertex> axesVertices = createAxesVertices(scene_.debug.axesLength);
-    uploadMesh(
-        axesMesh_,
+    const std::vector<RenderVertex> axesVertices = createAxesVertices(scene_.debug.axesLength);
+    rendermesh::uploadMesh(
+        &axesMesh_,
         axesVertices,
         createSequentialIndices(static_cast<int>(axesVertices.size())),
         GL_LINES);
 
-    const std::vector<Vertex> gridVertices =
-        createGridVertices(scene_.debug.gridHalfExtent, scene_.debug.gridStep);
-    uploadMesh(
-        gridMesh_,
+    const int gridRingCount = qMax(
+        kMinimumGridRingCount,
+        static_cast<int>(std::ceil(scene_.debug.gridHalfExtent / qMax(0.1f, scene_.debug.gridStep))));
+    const std::vector<RenderVertex> gridVertices = createGridVertices(static_cast<float>(gridRingCount), 1.0f);
+    rendermesh::uploadMesh(
+        &gridMesh_,
         gridVertices,
         createSequentialIndices(static_cast<int>(gridVertices.size())),
         GL_LINES);
 
-    const std::vector<Vertex> translateVertices = createAxesVertices(1.0f);
-    uploadMesh(
-        translateAxisGizmoMesh_,
+    const std::vector<RenderVertex> translateVertices = createAxesVertices(1.0f);
+    rendermesh::uploadMesh(
+        &translateAxisGizmoMesh_,
         translateVertices,
         createSequentialIndices(static_cast<int>(translateVertices.size())),
         GL_LINES);
 
-    const std::vector<Vertex> translatePlaneVertices = createTranslatePlaneVertices(kTranslatePlaneInner, kTranslatePlaneOuter);
-    uploadMesh(
-        translatePlaneGizmoMesh_,
+    const std::vector<RenderVertex> translatePlaneVertices =
+        createTranslatePlaneVertices(kTranslatePlaneInner, kTranslatePlaneOuter);
+    rendermesh::uploadMesh(
+        &translatePlaneGizmoMesh_,
         translatePlaneVertices,
         createSequentialIndices(static_cast<int>(translatePlaneVertices.size())),
         GL_LINES);
 
-    const std::vector<Vertex> scaleVertices = createScaleGizmoVertices(1.0f, 0.08f);
-    uploadMesh(
-        scaleGizmoMesh_,
+    const std::vector<RenderVertex> scaleVertices = createScaleGizmoVertices(1.0f, 0.08f);
+    rendermesh::uploadMesh(
+        &scaleGizmoMesh_,
         scaleVertices,
         createSequentialIndices(static_cast<int>(scaleVertices.size())),
         GL_LINES);
 
-    const std::vector<Vertex> rotationVertices = createRotationRingVertices(1.0f, kRotationRingSegments);
-    uploadMesh(
-        rotationGizmoMesh_,
+    const std::vector<RenderVertex> rotationVertices =
+        createRotationRingVertices(1.0f, kRotationRingSegments);
+    rendermesh::uploadMesh(
+        &rotationGizmoMesh_,
         rotationVertices,
         createSequentialIndices(static_cast<int>(rotationVertices.size())),
         GL_LINES);
 
-    const std::vector<Vertex> selectionVertices = createSelectionBracketVertices(0.28f);
-    uploadMesh(
-        selectionMesh_,
+    const std::vector<RenderVertex> selectionVertices = createSelectionBracketVertices(0.28f);
+    rendermesh::uploadMesh(
+        &selectionMesh_,
         selectionVertices,
         createSequentialIndices(static_cast<int>(selectionVertices.size())),
         GL_LINES);
+}
 
-    QSet<QString> initializedModels;
-    for (const RenderObjectConfig& object : scene_.objects) {
-        if (object.geometry == GeometryType::Model && !object.sourcePath.isEmpty()) {
-            const QString key = resolvePath(object.sourcePath);
-            if (!initializedModels.contains(key)) {
-                initializeModelMesh(key);
-                initializedModels.insert(key);
-            }
-        }
-    }
+void RenderWidget::rebuildRenderScene(bool reloadResources) {
+    resourceManager_.sync(scene_, reloadResources, [this](const QString& path) {
+        return resolvePath(path);
+    });
+    compiledScene_ = RenderSceneCompiler::compile(scene_, resourceManager_, [this](const QString& path) {
+        return resolvePath(path);
+    });
 }
 
 void RenderWidget::destroySceneResources() {
-    materials_.clear();
-    for (auto it = modelMeshes_.begin(); it != modelMeshes_.end(); ++it) {
-        if (it.value()) {
-            for (const auto& part : it.value()->parts) {
-                if (part) {
-                    destroyMesh(part->mesh);
-                }
-            }
-        }
-    }
-    modelMeshes_.clear();
-    destroyMesh(cubeMesh_);
-    destroyMesh(axesMesh_);
-    destroyMesh(gridMesh_);
-    destroyMesh(translateAxisGizmoMesh_);
-    destroyMesh(translatePlaneGizmoMesh_);
-    destroyMesh(scaleGizmoMesh_);
-    destroyMesh(rotationGizmoMesh_);
-    destroyMesh(selectionMesh_);
-}
-
-void RenderWidget::destroyMesh(MeshHandle& mesh) {
-    mesh.vao.destroy();
-    mesh.vbo.destroy();
-    mesh.ebo.destroy();
-    mesh.indexCount = 0;
+    compiledScene_.clear();
+    resourceManager_.clear();
+    rendermesh::destroyMesh(&cubeMesh_);
+    rendermesh::destroyMesh(&axesMesh_);
+    rendermesh::destroyMesh(&gridMesh_);
+    rendermesh::destroyMesh(&translateAxisGizmoMesh_);
+    rendermesh::destroyMesh(&translatePlaneGizmoMesh_);
+    rendermesh::destroyMesh(&scaleGizmoMesh_);
+    rendermesh::destroyMesh(&rotationGizmoMesh_);
+    rendermesh::destroyMesh(&selectionMesh_);
 }
 
 void RenderWidget::resetCameraFromScene() {
@@ -1868,86 +1963,7 @@ void RenderWidget::syncMouseCapture() {
     unsetCursor();
 }
 
-void RenderWidget::initializeModelMesh(const QString& sourcePath) {
-    if (sourcePath.isEmpty() || modelMeshes_.contains(sourcePath)) {
-        return;
-    }
-
-    auto runtime = std::make_shared<ModelRuntime>();
-    try {
-        const ModelImportData imported = ModelLoader::importModel(sourcePath);
-        runtime->boundsMin = imported.boundsMin;
-        runtime->boundsMax = imported.boundsMax;
-        runtime->parts.reserve(imported.subMeshes.size());
-
-        for (const ImportedSubMeshData& subMesh : imported.subMeshes) {
-            if (!subMesh.mesh.isValid()) {
-                continue;
-            }
-
-            auto part = std::make_unique<ModelPartRuntime>();
-            part->materialSlot = subMesh.materialSlot;
-
-            std::vector<Vertex> vertices;
-            vertices.reserve(static_cast<size_t>(subMesh.mesh.vertices.size()));
-            for (const ModelVertexData& vertex : subMesh.mesh.vertices) {
-                vertices.push_back(makeVertex(vertex.position, vertex.normal, vertex.uv.x(), vertex.uv.y()));
-            }
-
-            std::vector<quint32> indices;
-            indices.reserve(static_cast<size_t>(subMesh.mesh.indices.size()));
-            for (quint32 index : subMesh.mesh.indices) {
-                indices.push_back(index);
-            }
-
-            uploadMesh(part->mesh, vertices, indices, GL_TRIANGLES);
-            part->valid = part->mesh.indexCount > 0;
-            runtime->parts.push_back(std::move(part));
-        }
-
-        for (const auto& part : runtime->parts) {
-            runtime->valid = runtime->valid || (part && part->valid);
-        }
-    } catch (const std::exception& exception) {
-        qWarning() << "Failed to load model" << sourcePath << exception.what();
-    }
-
-    modelMeshes_.insert(sourcePath, runtime);
-}
-
-void RenderWidget::uploadMesh(
-    MeshHandle& mesh,
-    const std::vector<Vertex>& vertices,
-    const std::vector<quint32>& indices,
-    GLenum primitiveType) {
-    require(mesh.vao.create(), QStringLiteral("failed to create VAO"));
-    require(mesh.vbo.create(), QStringLiteral("failed to create VBO"));
-    require(mesh.ebo.create(), QStringLiteral("failed to create EBO"));
-
-    mesh.vao.bind();
-    mesh.vbo.bind();
-    mesh.vbo.allocate(vertices.data(), static_cast<int>(vertices.size() * sizeof(Vertex)));
-    mesh.ebo.bind();
-    mesh.ebo.allocate(indices.data(), static_cast<int>(indices.size() * sizeof(quint32)));
-
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), reinterpret_cast<void*>(offsetof(Vertex, px)));
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), reinterpret_cast<void*>(offsetof(Vertex, nx)));
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(Vertex), reinterpret_cast<void*>(offsetof(Vertex, u)));
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(3, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), reinterpret_cast<void*>(offsetof(Vertex, cr)));
-    glEnableVertexAttribArray(3);
-
-    mesh.vao.release();
-    mesh.vbo.release();
-    mesh.ebo.release();
-
-    mesh.indexCount = static_cast<int>(indices.size());
-    mesh.primitiveType = primitiveType;
-}
-
-std::vector<RenderWidget::Vertex> RenderWidget::createCubeVertices() {
+std::vector<RenderVertex> RenderWidget::createCubeVertices() {
     return {
         makeVertex({-0.5f, -0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}, 0.0f, 0.0f),
         makeVertex({0.5f, -0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}, 1.0f, 0.0f),
@@ -1992,7 +2008,7 @@ std::vector<quint32> RenderWidget::createCubeIndices() {
     };
 }
 
-std::vector<RenderWidget::Vertex> RenderWidget::createAxesVertices(float length) {
+std::vector<RenderVertex> RenderWidget::createAxesVertices(float length) {
     return {
         makeVertex({0.0f, 0.0f, 0.0f}, {}, 0.0f, 0.0f, {1.0f, 0.2f, 0.2f}),
         makeVertex({length, 0.0f, 0.0f}, {}, 0.0f, 0.0f, {1.0f, 0.2f, 0.2f}),
@@ -2003,7 +2019,7 @@ std::vector<RenderWidget::Vertex> RenderWidget::createAxesVertices(float length)
     };
 }
 
-std::vector<RenderWidget::Vertex> RenderWidget::createTranslatePlaneVertices(float inner, float outer) {
+std::vector<RenderVertex> RenderWidget::createTranslatePlaneVertices(float inner, float outer) {
     return {
         makeVertex({inner, inner, 0.0f}, {}, 0.0f, 0.0f, {1.0f, 0.75f, 0.22f}),
         makeVertex({outer, inner, 0.0f}, {}, 0.0f, 0.0f, {1.0f, 0.75f, 0.22f}),
@@ -2034,7 +2050,7 @@ std::vector<RenderWidget::Vertex> RenderWidget::createTranslatePlaneVertices(flo
     };
 }
 
-std::vector<RenderWidget::Vertex> RenderWidget::createScaleGizmoVertices(float length, float handleSize) {
+std::vector<RenderVertex> RenderWidget::createScaleGizmoVertices(float length, float handleSize) {
     return {
         makeVertex({0.0f, 0.0f, 0.0f}, {}, 0.0f, 0.0f, {1.0f, 0.2f, 0.2f}),
         makeVertex({length, 0.0f, 0.0f}, {}, 0.0f, 0.0f, {1.0f, 0.2f, 0.2f}),
@@ -2059,8 +2075,8 @@ std::vector<RenderWidget::Vertex> RenderWidget::createScaleGizmoVertices(float l
     };
 }
 
-std::vector<RenderWidget::Vertex> RenderWidget::createRotationRingVertices(float radius, int segments) {
-    std::vector<Vertex> vertices;
+std::vector<RenderVertex> RenderWidget::createRotationRingVertices(float radius, int segments) {
+    std::vector<RenderVertex> vertices;
     vertices.reserve(static_cast<size_t>(segments * 2 * 3));
 
     const auto appendRing = [&vertices, radius, segments](
@@ -2089,12 +2105,12 @@ std::vector<RenderWidget::Vertex> RenderWidget::createRotationRingVertices(float
     return vertices;
 }
 
-std::vector<RenderWidget::Vertex> RenderWidget::createSelectionBracketVertices(float lengthRatio) {
+std::vector<RenderVertex> RenderWidget::createSelectionBracketVertices(float lengthRatio) {
     const float minCorner = -0.5f;
     const float maxCorner = 0.5f;
     const float inset = qBound(0.08f, lengthRatio, 0.48f);
 
-    std::vector<Vertex> vertices;
+    std::vector<RenderVertex> vertices;
     vertices.reserve(48);
 
     const auto appendCorner = [&vertices, inset](float x, float y, float z, const QVector3D& color) {
@@ -2123,21 +2139,24 @@ std::vector<RenderWidget::Vertex> RenderWidget::createSelectionBracketVertices(f
     return vertices;
 }
 
-std::vector<RenderWidget::Vertex> RenderWidget::createGridVertices(float halfExtent, float step) {
+std::vector<RenderVertex> RenderWidget::createGridVertices(float halfExtent, float step) {
     const float safeHalfExtent = qMax(2.0f, halfExtent);
     const float safeStep = qMax(0.25f, step);
     const int lineCount = static_cast<int>(std::floor(safeHalfExtent / safeStep));
     const float y = 0.001f;
 
-    std::vector<Vertex> vertices;
+    std::vector<RenderVertex> vertices;
     vertices.reserve(static_cast<size_t>((lineCount * 2 + 1) * 4));
 
     for (int index = -lineCount; index <= lineCount; ++index) {
         const float offset = static_cast<float>(index) * safeStep;
-        const bool majorLine = index == 0;
-        const QVector3D color = majorLine
+        const bool axisLine = index == 0;
+        const bool majorLine = axisLine || (std::abs(index) % 10 == 0);
+        const QVector3D color = axisLine
             ? QVector3D(0.48f, 0.52f, 0.58f)
-            : QVector3D(0.26f, 0.28f, 0.31f);
+            : majorLine
+                ? QVector3D(0.34f, 0.36f, 0.4f)
+                : QVector3D(0.26f, 0.28f, 0.31f);
 
         vertices.push_back(makeVertex({-safeHalfExtent, y, offset}, {}, 0.0f, 0.0f, color));
         vertices.push_back(makeVertex({safeHalfExtent, y, offset}, {}, 0.0f, 0.0f, color));
@@ -2155,15 +2174,6 @@ std::vector<quint32> RenderWidget::createSequentialIndices(int vertexCount) {
         indices.push_back(static_cast<quint32>(index));
     }
     return indices;
-}
-
-RenderWidget::MaterialRuntime& RenderWidget::requireMaterial(const QString& materialId) {
-    auto it = materials_.find(materialId);
-    if (it != materials_.end()) {
-        return it.value();
-    }
-
-    return materials_[QStringLiteral("__default__")];
 }
 
 QString RenderWidget::resolvePath(const QString& relativePath) const {
@@ -2192,6 +2202,9 @@ QMatrix4x4 RenderWidget::buildProjectionMatrix() const {
 }
 
 QMatrix4x4 RenderWidget::buildObjectModelMatrix(int index) const {
+    if (index >= 0 && index < compiledScene_.objects.size()) {
+        return compiledScene_.objects.at(index).worldTransform;
+    }
     return scenegraph::buildWorldTransform(scene_, index);
 }
 
@@ -2215,14 +2228,16 @@ QMatrix4x4 RenderWidget::buildParentWorldMatrix(int index) const {
 
 QMatrix4x4 RenderWidget::buildGizmoModelMatrix() const {
     QMatrix4x4 model;
-    model.translate(objectCenter(selectedObjectIndex_));
-    if (coordinateSpace_ == CoordinateSpace::Local &&
-        selectedObjectIndex_ >= 0 &&
-        selectedObjectIndex_ < scene_.objects.size()) {
-        model.rotate(buildWorldRotation(selectedObjectIndex_));
+    model.translate(activeGizmoOrigin());
+    if (coordinateSpace_ == CoordinateSpace::Local && activeTransformTarget() != TransformTarget::None) {
+        model.rotate(activeGizmoOrientation());
     }
     model.scale(gizmoScale());
     return model;
+}
+
+QMatrix4x4 RenderWidget::buildGridModelMatrix() const {
+    return viewport::buildGridModelMatrix(effectiveGridStep(), cameraTarget_);
 }
 
 QMatrix4x4 RenderWidget::buildSelectionModelMatrix(int index, float inflate) const {
@@ -2261,38 +2276,26 @@ QQuaternion RenderWidget::buildWorldRotation(int index) const {
     return rotation.normalized();
 }
 
+QQuaternion RenderWidget::buildLightRotation(int index) const {
+    if (index < 0 || index >= scene_.lights.size()) {
+        return QQuaternion();
+    }
+
+    return lightOrientationFromDirection(normalizedLightDirection(scene_.lights.at(index)));
+}
+
 QVector3D RenderWidget::objectLocalBoundsMin(int index) const {
-    if (index < 0 || index >= scene_.objects.size()) {
+    if (index < 0 || index >= compiledScene_.objects.size()) {
         return QVector3D(-0.5f, -0.5f, -0.5f);
     }
-
-    const RenderObjectConfig& object = scene_.objects.at(index);
-    if (object.geometry == GeometryType::Model) {
-        const QString key = resolvePath(object.sourcePath);
-        const auto it = modelMeshes_.find(key);
-        if (it != modelMeshes_.end() && it.value()) {
-            return it.value()->boundsMin;
-        }
-    }
-
-    return QVector3D(-0.5f, -0.5f, -0.5f);
+    return compiledScene_.objects.at(index).localBoundsMin;
 }
 
 QVector3D RenderWidget::objectLocalBoundsMax(int index) const {
-    if (index < 0 || index >= scene_.objects.size()) {
+    if (index < 0 || index >= compiledScene_.objects.size()) {
         return QVector3D(0.5f, 0.5f, 0.5f);
     }
-
-    const RenderObjectConfig& object = scene_.objects.at(index);
-    if (object.geometry == GeometryType::Model) {
-        const QString key = resolvePath(object.sourcePath);
-        const auto it = modelMeshes_.find(key);
-        if (it != modelMeshes_.end() && it.value()) {
-            return it.value()->boundsMax;
-        }
-    }
-
-    return QVector3D(0.5f, 0.5f, 0.5f);
+    return compiledScene_.objects.at(index).localBoundsMax;
 }
 
 QVector3D RenderWidget::objectCenter(int index) const {
@@ -2315,6 +2318,22 @@ float RenderWidget::objectRadius(int index) const {
         buildObjectModelMatrix(index).column(1).toVector3D().length(),
         buildObjectModelMatrix(index).column(2).toVector3D().length());
     return QVector3D(halfExtent.x() * scale.x(), halfExtent.y() * scale.y(), halfExtent.z() * scale.z()).length();
+}
+
+QVector3D RenderWidget::lightCenter(int index) const {
+    if (index < 0 || index >= scene_.lights.size()) {
+        return cameraPosition_ + cameraFront_ * orbitDistance_;
+    }
+
+    return scene_.lights.at(index).position;
+}
+
+float RenderWidget::lightRadius(int index) const {
+    if (index < 0 || index >= scene_.lights.size()) {
+        return 1.0f;
+    }
+
+    return viewport::buildLightMarkerStyle(scene_.lights.at(index), false).focusRadius;
 }
 
 QVector3D RenderWidget::selectionCenter() const {
@@ -2340,6 +2359,10 @@ float RenderWidget::selectionRadius() const {
         radius = qMax(radius, (objectCenter(index) - center).length() + objectRadius(index));
     }
     return radius;
+}
+
+float RenderWidget::effectiveGridStep() const {
+    return viewport::effectiveGridStep(scene_.debug.gridStep, cameraPosition_, cameraTarget_);
 }
 
 QRect RenderWidget::normalizedSelectionRect() const {

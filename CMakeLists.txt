@@ -37,9 +37,21 @@ endif()
 qt_add_executable(openglStudy
     src/main.cpp
     src/app/MainWindow.cpp
+    src/app/MainWindowUi.cpp
     src/app/MainWindow.hpp
     src/app/ModelLoader.cpp
     src/app/ModelLoader.hpp
+    src/app/RenderBackendTypes.hpp
+    src/app/RenderMeshUtils.cpp
+    src/app/RenderMeshUtils.hpp
+    src/app/RenderResourceManager.cpp
+    src/app/RenderResourceManager.hpp
+    src/app/RenderSceneCompiler.cpp
+    src/app/RenderSceneCompiler.hpp
+    src/app/RenderViewportHelpers.cpp
+    src/app/RenderViewportHelpers.hpp
+    src/app/SceneRenderer.cpp
+    src/app/SceneRenderer.hpp
     src/app/RenderWidget.cpp
     src/app/RenderWidget.hpp
     src/app/SceneGraph.cpp

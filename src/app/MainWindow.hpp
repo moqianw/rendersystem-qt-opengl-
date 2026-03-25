@@ -10,9 +10,11 @@ class QCloseEvent;
 class QComboBox;
 class QDockWidget;
 class QDoubleSpinBox;
+class QAction;
 class QLabel;
 class QLineEdit;
 class QListWidget;
+class QMenu;
 class QTreeWidget;
 class QUndoStack;
 
@@ -26,6 +28,8 @@ protected:
     void closeEvent(QCloseEvent* event) override;
 
 private:
+    void createSceneResourceActions();
+    void populateAddResourceMenu(QMenu* menu);
     void createMenus();
     void createDocks();
     void createLightsPanel(QDockWidget* dock);
@@ -68,11 +72,20 @@ private:
         const QVector3D& position,
         const QVector3D& rotationDegrees,
         const QVector3D& scale);
+    void applyViewportLightTransformPreview(
+        int index,
+        const QVector3D& position,
+        const QVector3D& direction);
     void commitViewportTransform(
         int index,
         const QVector3D& position,
         const QVector3D& rotationDegrees,
         const QVector3D& scale,
+        RenderWidget::TransformMode mode);
+    void commitViewportLightTransform(
+        int index,
+        const QVector3D& position,
+        const QVector3D& direction,
         RenderWidget::TransformMode mode);
     void updateCameraPanel(const QVector3D& position, const QVector3D& target, float distance);
     void setTransformMode(RenderWidget::TransformMode mode);
@@ -103,6 +116,9 @@ private:
     QDockWidget* lightsDock_ = nullptr;
     QDockWidget* cameraDock_ = nullptr;
     QDockWidget* toolsDock_ = nullptr;
+    QAction* addCubeAction_ = nullptr;
+    QAction* importModelAction_ = nullptr;
+    QAction* addLightAction_ = nullptr;
     QTreeWidget* objectTree_ = nullptr;
     QListWidget* materialList_ = nullptr;
     QLineEdit* nameEdit_ = nullptr;

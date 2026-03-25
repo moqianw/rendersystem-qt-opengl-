@@ -1,13 +1,9 @@
 #pragma once
 
 #include <QElapsedTimer>
-#include <QHash>
 #include <QMatrix4x4>
-#include <QOpenGLBuffer>
 #include <QOpenGLFunctions_4_5_Core>
 #include <QOpenGLShaderProgram>
-#include <QOpenGLTexture>
-#include <QOpenGLVertexArrayObject>
 #include <QOpenGLWidget>
 #include <QPoint>
 #include <QPointF>
@@ -18,10 +14,11 @@
 #include <QTimer>
 #include <QVector3D>
 
-#include <memory>
 #include <vector>
 
-#include "app/ModelLoader.hpp"
+#include "app/RenderBackendTypes.hpp"
+#include "app/RenderResourceManager.hpp"
+#include "app/SceneRenderer.hpp"
 #include "app/SceneConfig.hpp"
 
 class QFocusEvent;
@@ -63,20 +60,6 @@ public:
         YZ
     };
 
-    struct Vertex {
-        float px;
-        float py;
-        float pz;
-        float nx;
-        float ny;
-        float nz;
-        float u;
-        float v;
-        float cr;
-        float cg;
-        float cb;
-    };
-
     explicit RenderWidget(const SceneConfig& scene, QWidget* parent = nullptr);
     ~RenderWidget() override;
 
@@ -84,8 +67,10 @@ public:
     void setScene(const SceneConfig& scene, SceneUpdateMode updateMode, bool resetCamera = false);
     void setSelection(const QVector<int>& indices, int activeIndex);
     void setSelectedObjectIndex(int index);
+    void setSelectedLightIndex(int index);
     QVector<int> selectedObjectIndices() const;
     int selectedObjectIndex() const;
+    int selectedLightIndex() const;
     void setTransformMode(TransformMode mode);
     TransformMode transformMode() const;
     void setCoordinateSpace(CoordinateSpace space);
@@ -99,6 +84,7 @@ public:
 
 signals:
     void selectionChanged(const QVector<int>& indices, int activeIndex);
+    void lightSelectionChanged(int index);
     void cameraStateChanged(const QVector3D& position, const QVector3D& target, float distance);
     void objectTransformInteractionStarted(int index, renderer::RenderWidget::TransformMode mode);
     void objectTransformPreview(
@@ -111,6 +97,16 @@ signals:
         const QVector3D& position,
         const QVector3D& rotationDegrees,
         const QVector3D& scale,
+        renderer::RenderWidget::TransformMode mode);
+    void lightTransformInteractionStarted(int index, renderer::RenderWidget::TransformMode mode);
+    void lightTransformPreview(
+        int index,
+        const QVector3D& position,
+        const QVector3D& direction);
+    void lightTransformInteractionFinished(
+        int index,
+        const QVector3D& position,
+        const QVector3D& direction,
         renderer::RenderWidget::TransformMode mode);
     void transformModeChanged(renderer::RenderWidget::TransformMode mode);
     void coordinateSpaceChanged(renderer::RenderWidget::CoordinateSpace space);
@@ -133,32 +129,6 @@ private:
         QVector3D direction;
     };
 
-    struct MeshHandle {
-        QOpenGLVertexArrayObject vao;
-        QOpenGLBuffer vbo{QOpenGLBuffer::VertexBuffer};
-        QOpenGLBuffer ebo{QOpenGLBuffer::IndexBuffer};
-        int indexCount = 0;
-        GLenum primitiveType = GL_TRIANGLES;
-    };
-
-    struct MaterialRuntime {
-        QVector3D tint = QVector3D(1.0f, 1.0f, 1.0f);
-        std::shared_ptr<QOpenGLTexture> texture;
-    };
-
-    struct ModelPartRuntime {
-        MeshHandle mesh;
-        int materialSlot = -1;
-        bool valid = false;
-    };
-
-    struct ModelRuntime {
-        std::vector<std::unique_ptr<ModelPartRuntime>> parts;
-        QVector3D boundsMin = QVector3D(-0.5f, -0.5f, -0.5f);
-        QVector3D boundsMax = QVector3D(0.5f, 0.5f, 0.5f);
-        bool valid = false;
-    };
-
     enum class MouseMode {
         None,
         Look,
@@ -170,6 +140,12 @@ private:
         Scale
     };
 
+    enum class TransformTarget {
+        None,
+        Object,
+        Light
+    };
+
     void onFrame();
     void updateCamera(float deltaSeconds);
     void updateCameraVectors();
@@ -179,16 +155,25 @@ private:
     void orbitCamera(const QPoint& deltaPixels);
     void applySelection(const QVector<int>& indices, int activeIndex, bool emitSignal);
     QVector<int> normalizedSelection(const QVector<int>& indices, int fallbackIndex = -1) const;
+    TransformTarget activeTransformTarget() const;
+    bool hasActiveSelection() const;
+    bool canRenderActiveGizmo() const;
+    QVector3D activeSelectionCenter() const;
+    float activeSelectionRadius() const;
+    QVector3D activeGizmoOrigin() const;
+    QQuaternion activeGizmoOrientation() const;
     void emitCameraState();
     void pickAt(const QPointF& position, Qt::KeyboardModifiers modifiers);
     void selectInRect(const QRect& rect, Qt::KeyboardModifiers modifiers);
-    int pickObject(const QPointF& position) const;
+    int pickObject(const QPointF& position, float* hitDistance = nullptr) const;
+    int pickLight(const QPointF& position, float* hitDistance = nullptr) const;
     QVector<int> pickObjectsInRect(const QRect& rect) const;
     GizmoHandle pickGizmoHandle(const QPointF& position) const;
     GizmoHandle pickLinearGizmoHandle(const QPointF& position) const;
     GizmoHandle pickRotationAxis(const QPointF& position) const;
     Ray buildPickRay(const QPointF& position) const;
     bool intersectObject(const Ray& ray, int objectIndex, float* distance) const;
+    bool intersectLight(const Ray& ray, int lightIndex, float* distance) const;
     bool solveAxisDragParameter(const Ray& ray, GizmoHandle axis, float* parameter) const;
     bool solvePlaneDragPoint(const Ray& ray, GizmoHandle plane, QVector3D* point) const;
     QVector3D baseAxisDirection(GizmoHandle axis) const;
@@ -201,44 +186,47 @@ private:
     float snapScalar(float value, float step) const;
     float rotationDragDegrees(const QPoint& mousePosition) const;
     void emitTransformPreview();
+    void emitLightTransformPreview();
+    void renderDebugPass(const QMatrix4x4& view, const QMatrix4x4& projection);
+    void renderGridPass();
+    void renderLightMarkers();
+    void renderObjectSelectionPass();
+    void renderActiveGizmoPass();
     void initializeShaders();
-    void initializeTextures();
     void initializeGeometry();
     void cleanupOpenGL();
+    void rebuildRenderScene(bool reloadResources);
     void destroySceneResources();
-    void destroyMesh(MeshHandle& mesh);
     void resetCameraFromScene();
     void syncMouseCapture();
-    void initializeModelMesh(const QString& sourcePath);
-    void uploadMesh(
-        MeshHandle& mesh,
-        const std::vector<Vertex>& vertices,
-        const std::vector<quint32>& indices,
-        GLenum primitiveType);
-    static std::vector<Vertex> createCubeVertices();
+    static std::vector<RenderVertex> createCubeVertices();
     static std::vector<quint32> createCubeIndices();
-    static std::vector<Vertex> createAxesVertices(float length);
-    static std::vector<Vertex> createTranslatePlaneVertices(float inner, float outer);
-    static std::vector<Vertex> createScaleGizmoVertices(float length, float handleSize);
-    static std::vector<Vertex> createRotationRingVertices(float radius, int segments);
-    static std::vector<Vertex> createSelectionBracketVertices(float lengthRatio);
-    static std::vector<Vertex> createGridVertices(float halfExtent, float step);
+    static std::vector<RenderVertex> createAxesVertices(float length);
+    static std::vector<RenderVertex> createTranslatePlaneVertices(float inner, float outer);
+    static std::vector<RenderVertex> createScaleGizmoVertices(float length, float handleSize);
+    static std::vector<RenderVertex> createRotationRingVertices(float radius, int segments);
+    static std::vector<RenderVertex> createSelectionBracketVertices(float lengthRatio);
+    static std::vector<RenderVertex> createGridVertices(float halfExtent, float step);
     static std::vector<quint32> createSequentialIndices(int vertexCount);
-    MaterialRuntime& requireMaterial(const QString& materialId);
     QString resolvePath(const QString& relativePath) const;
     QMatrix4x4 buildViewMatrix() const;
     QMatrix4x4 buildProjectionMatrix() const;
     QMatrix4x4 buildObjectModelMatrix(int index) const;
     QMatrix4x4 buildParentWorldMatrix(int index) const;
     QMatrix4x4 buildGizmoModelMatrix() const;
+    QMatrix4x4 buildGridModelMatrix() const;
     QMatrix4x4 buildSelectionModelMatrix(int index, float inflate) const;
     QQuaternion buildWorldRotation(int index) const;
+    QQuaternion buildLightRotation(int index) const;
     QVector3D objectLocalBoundsMin(int index) const;
     QVector3D objectLocalBoundsMax(int index) const;
     QVector3D objectCenter(int index) const;
     float objectRadius(int index) const;
+    QVector3D lightCenter(int index) const;
+    float lightRadius(int index) const;
     QVector3D selectionCenter() const;
     float selectionRadius() const;
+    float effectiveGridStep() const;
     QRect normalizedSelectionRect() const;
     bool projectObjectScreenRect(int index, QRectF* screenRect) const;
     bool projectToScreen(const QVector3D& worldPoint, QPointF* screenPoint) const;
@@ -261,6 +249,7 @@ private:
     QVector3D gizmoDragStartPosition_ = QVector3D(0.0f, 0.0f, 0.0f);
     QVector3D gizmoDragStartRotationDegrees_ = QVector3D(0.0f, 0.0f, 0.0f);
     QVector3D gizmoDragStartScale_ = QVector3D(1.0f, 1.0f, 1.0f);
+    QVector3D gizmoDragStartLightDirection_ = QVector3D(0.0f, -1.0f, 0.0f);
     QVector3D gizmoDragStartWorldPoint_ = QVector3D(0.0f, 0.0f, 0.0f);
     float gizmoDragStartParameter_ = 0.0f;
     QVector3D cameraPosition_;
@@ -278,10 +267,10 @@ private:
     float nearClip_ = 0.1f;
     float farClip_ = 200.0f;
 
-    QOpenGLShaderProgram sceneProgram_;
+    SceneRenderer sceneRenderer_;
     QOpenGLShaderProgram debugProgram_;
-    QHash<QString, MaterialRuntime> materials_;
-    QHash<QString, std::shared_ptr<ModelRuntime>> modelMeshes_;
+    RenderResourceManager resourceManager_;
+    CompiledRenderScene compiledScene_;
     MeshHandle cubeMesh_;
     MeshHandle axesMesh_;
     MeshHandle gridMesh_;
@@ -292,6 +281,7 @@ private:
     MeshHandle selectionMesh_;
     QVector<int> selectedObjectIndices_;
     int selectedObjectIndex_ = -1;
+    int selectedLightIndex_ = -1;
     bool snapEnabled_ = false;
     float moveSnapStep_ = 1.0f;
     float rotateSnapStepDegrees_ = 15.0f;

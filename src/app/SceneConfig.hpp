@@ -96,4 +96,7 @@ struct SceneConfig {
     static void saveToFile(const SceneConfig& config, const QString& path);
 };
 
+using RenderObject = RenderObjectConfig;
+using Scene = SceneConfig;
+
 }  // namespace renderer
