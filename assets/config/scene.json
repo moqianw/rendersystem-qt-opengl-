@@ -18,10 +18,37 @@
   },
   "lights": [
     {
+      "type": "directional",
+      "position": [8.0, 10.0, 6.0],
+      "direction": [-0.45, -1.0, -0.3],
+      "color": [1.0, 0.96, 0.9],
+      "ambientStrength": 0.2,
+      "intensity": 0.75,
+      "range": 30.0,
+      "innerConeDegrees": 18.0,
+      "outerConeDegrees": 28.0
+    },
+    {
+      "type": "point",
       "position": [10.0, 12.0, 8.0],
-      "color": [1.0, 0.97, 0.92],
-      "ambientStrength": 0.18,
-      "intensity": 1.15
+      "direction": [0.0, -1.0, 0.0],
+      "color": [1.0, 0.78, 0.65],
+      "ambientStrength": 0.08,
+      "intensity": 1.4,
+      "range": 32.0,
+      "innerConeDegrees": 20.0,
+      "outerConeDegrees": 30.0
+    },
+    {
+      "type": "spot",
+      "position": [-6.0, 7.0, 4.0],
+      "direction": [0.65, -0.7, -0.25],
+      "color": [0.6, 0.78, 1.0],
+      "ambientStrength": 0.03,
+      "intensity": 1.9,
+      "range": 26.0,
+      "innerConeDegrees": 16.0,
+      "outerConeDegrees": 25.0
     }
   ],
   "materials": [
@@ -69,6 +96,12 @@
     }
   ],
   "debug": {
+    "drawGrid": true,
+    "gridHalfExtent": 20.0,
+    "gridStep": 1.0,
+    "snapEnabled": false,
+    "rotateSnapDegrees": 15.0,
+    "scaleSnapStep": 0.1,
     "drawAxes": true,
     "axesLength": 8.0,
     "drawLightGizmo": true

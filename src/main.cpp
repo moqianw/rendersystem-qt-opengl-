@@ -26,7 +26,7 @@ int main(int argc, char* argv[]) {
             QDir(QCoreApplication::applicationDirPath()).filePath("assets/config/scene.json");
         const renderer::SceneConfig scene = renderer::SceneConfig::loadFromFile(scenePath);
 
-        renderer::MainWindow window(scene);
+        renderer::MainWindow window(scene, scenePath);
         window.show();
         return application.exec();
     } catch (const std::exception& exception) {
