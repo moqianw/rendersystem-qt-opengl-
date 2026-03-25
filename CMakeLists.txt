@@ -61,6 +61,10 @@ qt_add_executable(openglStudy
     src/app/SceneGraph.hpp
     src/app/SceneConfig.cpp
     src/app/SceneConfig.hpp
+    src/app/SceneDocument.cpp
+    src/app/SceneDocument.hpp
+    src/app/SceneEditorService.cpp
+    src/app/SceneEditorService.hpp
 )
 
 target_include_directories(openglStudy PRIVATE

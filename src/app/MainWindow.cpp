@@ -20,17 +20,13 @@
 #include <QListWidget>
 #include <QMenuBar>
 #include <QMessageBox>
-#include <QPushButton>
 #include <QSet>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QStatusBar>
-#include <QToolBar>
 #include <QTreeWidget>
 #include <QTreeWidgetItem>
 #include <QTreeWidgetItemIterator>
-#include <QUndoCommand>
-#include <QUndoStack>
 #include <QVBoxLayout>
 #include <QWidget>
 
@@ -40,6 +36,7 @@
 #include <functional>
 
 #include "app/ModelLoader.hpp"
+#include "app/SceneDocument.hpp"
 #include "app/SceneGraph.hpp"
 
 namespace {
@@ -274,23 +271,6 @@ bool sameScene(const renderer::SceneConfig& left, const renderer::SceneConfig& r
     return true;
 }
 
-int clampSelectedIndex(const renderer::SceneConfig& scene, int index) {
-    if (scene.objects.isEmpty()) {
-        return -1;
-    }
-
-    return qBound(0, index < 0 ? 0 : index, scene.objects.size() - 1);
-}
-
-renderer::RenderWidget::SceneUpdateMode mergeUpdateMode(
-    renderer::RenderWidget::SceneUpdateMode left,
-    renderer::RenderWidget::SceneUpdateMode right) {
-    return left == renderer::RenderWidget::SceneUpdateMode::ReloadResources ||
-            right == renderer::RenderWidget::SceneUpdateMode::ReloadResources
-        ? renderer::RenderWidget::SceneUpdateMode::ReloadResources
-        : renderer::RenderWidget::SceneUpdateMode::TransformsOnly;
-}
-
 QVector<int> normalizeSelectionIndices(const renderer::SceneConfig& scene, const QVector<int>& indices) {
     QVector<int> normalized;
     QSet<int> visited;
@@ -303,121 +283,6 @@ QVector<int> normalizeSelectionIndices(const renderer::SceneConfig& scene, const
     }
     std::sort(normalized.begin(), normalized.end());
     return normalized;
-}
-
-QVector<int> topLevelSelectedIndices(const renderer::SceneConfig& scene, const QVector<int>& selection) {
-    const QVector<int> normalized = normalizeSelectionIndices(scene, selection);
-    if (normalized.isEmpty()) {
-        return {};
-    }
-
-    const QHash<QString, int> idLookup = renderer::scenegraph::buildIdLookup(scene);
-    QSet<QString> selectedIds;
-    for (int index : normalized) {
-        selectedIds.insert(scene.objects.at(index).id);
-    }
-
-    QVector<int> roots;
-    for (int index : normalized) {
-        QString parentId = scene.objects.at(index).parentId;
-        bool childOfSelection = false;
-        while (!parentId.isEmpty() && idLookup.contains(parentId)) {
-            if (selectedIds.contains(parentId)) {
-                childOfSelection = true;
-                break;
-            }
-            parentId = scene.objects.at(idLookup.value(parentId)).parentId;
-        }
-        if (!childOfSelection) {
-            roots.append(index);
-        }
-    }
-
-    return roots;
-}
-
-QVector<int> collectSubtreeSelection(const renderer::SceneConfig& scene, const QVector<int>& roots) {
-    QVector<int> collected;
-    QSet<int> visited;
-    for (int rootIndex : roots) {
-        for (int index : renderer::scenegraph::collectSubtree(scene, rootIndex)) {
-            if (visited.contains(index)) {
-                continue;
-            }
-            visited.insert(index);
-            collected.append(index);
-        }
-    }
-    std::sort(collected.begin(), collected.end());
-    return collected;
-}
-
-QVector<renderer::RenderObjectConfig> collectClipboardObjects(
-    const renderer::SceneConfig& scene,
-    const QVector<int>& roots,
-    bool clearExternalParents) {
-    QVector<renderer::RenderObjectConfig> objects;
-    QSet<QString> copiedIds;
-    for (int rootIndex : roots) {
-        for (int index : renderer::scenegraph::collectSubtree(scene, rootIndex)) {
-            objects.append(scene.objects.at(index));
-            copiedIds.insert(scene.objects.at(index).id);
-        }
-    }
-
-    if (!clearExternalParents) {
-        return objects;
-    }
-
-    for (renderer::RenderObjectConfig& object : objects) {
-        if (!object.parentId.isEmpty() && !copiedIds.contains(object.parentId)) {
-            object.parentId.clear();
-        }
-    }
-    return objects;
-}
-
-QVector<int> appendClonedObjects(
-    renderer::SceneConfig* scene,
-    const QVector<renderer::RenderObjectConfig>& prototypes,
-    bool preserveExternalParents,
-    const QVector3D& rootOffset) {
-    QVector<int> inserted;
-    if (!scene || prototypes.isEmpty()) {
-        return inserted;
-    }
-
-    QHash<QString, QString> remappedIds;
-    QSet<QString> internalIds;
-    for (const renderer::RenderObjectConfig& prototype : prototypes) {
-        internalIds.insert(prototype.id);
-    }
-
-    for (const renderer::RenderObjectConfig& prototype : prototypes) {
-        renderer::RenderObjectConfig clone = prototype;
-        const QString originalId = clone.id;
-        const QString originalParentId = clone.parentId;
-        clone.id = renderer::scenegraph::generateObjectId();
-        remappedIds.insert(originalId, clone.id);
-        clone.name = renderer::scenegraph::uniqueObjectName(
-            *scene,
-            clone.name.isEmpty() ? QStringLiteral("object") : clone.name);
-
-        if (!originalParentId.isEmpty() && remappedIds.contains(originalParentId)) {
-            clone.parentId = remappedIds.value(originalParentId);
-        } else if (!preserveExternalParents || originalParentId.isEmpty() || !internalIds.contains(originalParentId)) {
-            clone.parentId = preserveExternalParents ? originalParentId : QString();
-        }
-
-        if (originalParentId.isEmpty() || !internalIds.contains(originalParentId)) {
-            clone.position += rootOffset;
-        }
-
-        scene->objects.append(clone);
-        inserted.append(scene->objects.size() - 1);
-    }
-
-    return inserted;
 }
 
 QVector3D sanitizeLightDirection(const QVector3D& direction) {
@@ -479,57 +344,14 @@ QString ensureImportedMaterial(
     return material.id;
 }
 
-bool selectionIncludesModel(const renderer::SceneConfig& scene, const QVector<int>& selection) {
-    for (int index : selection) {
-        if (index >= 0 && index < scene.objects.size() && scene.objects.at(index).geometry == renderer::GeometryType::Model) {
-            return true;
-        }
-    }
-    return false;
-}
-
-class LambdaUndoCommand final : public QUndoCommand {
-public:
-    using Callback = std::function<void()>;
-
-    LambdaUndoCommand(const QString& text, Callback undo, Callback redo)
-        : QUndoCommand(text),
-          undo_(std::move(undo)),
-          redo_(std::move(redo)) {
-    }
-
-    void undo() override {
-        undo_();
-    }
-
-    void redo() override {
-        if (firstRedo_) {
-            firstRedo_ = false;
-            return;
-        }
-
-        redo_();
-    }
-
-private:
-    Callback undo_;
-    Callback redo_;
-    bool firstRedo_ = true;
-};
-
 }  // namespace
 
 namespace renderer {
 
 MainWindow::MainWindow(const SceneConfig& scene, const QString& scenePath, QWidget* parent)
     : QMainWindow(parent),
-      scenePath_(scenePath),
       scene_(scene),
-      undoStack_(new QUndoStack(this)) {
-    scenegraph::ensureObjectIds(&scene_);
-    for (LightConfig& light : scene_.lights) {
-        light = sanitizeLight(light);
-    }
+      document_(new SceneDocument(&scene_, scenePath, this)) {
     resize(scene_.window.size.expandedTo(QSize(1280, 820)));
     setMinimumSize(1024, 720);
     setDockNestingEnabled(true);
@@ -542,8 +364,14 @@ MainWindow::MainWindow(const SceneConfig& scene, const QString& scenePath, QWidg
     createDocks();
     createMenus();
 
-    connect(undoStack_, &QUndoStack::indexChanged, this, [this](int) {
-        dirty_ = !undoStack_->isClean() || sceneEditSessionActive_;
+    document_->setApplySceneCallback([this](
+                                         const SceneConfig& sceneState,
+                                         int selectionToken,
+                                         RenderWidget::SceneUpdateMode updateMode,
+                                         bool resetCamera) {
+        applySceneState(sceneState, selectionToken, updateMode, resetCamera);
+    });
+    connect(document_, &SceneDocument::dirtyChanged, this, [this](bool) {
         updateWindowCaption();
     });
 
@@ -642,11 +470,11 @@ MainWindow::MainWindow(const SceneConfig& scene, const QString& scenePath, QWidg
         updateCameraPanel(scene_.camera.position, scene_.camera.position + QVector3D(0.0f, 0.0f, -10.0f), 10.0f);
     }
 
-    undoStack_->clear();
-    undoStack_->setClean();
-    dirty_ = false;
+    document_->clearHistory();
     updateWindowCaption();
-    statusBar()->showMessage(QStringLiteral("Scene loaded from %1").arg(QFileInfo(scenePath_).fileName()), 3000);
+    statusBar()->showMessage(
+        QStringLiteral("Scene loaded from %1").arg(QFileInfo(document_->scenePath()).fileName()),
+        3000);
 }
 
 void MainWindow::closeEvent(QCloseEvent* event) {
@@ -1145,40 +973,11 @@ void MainWindow::applyInspectorMetadataEdits() {
 }
 
 void MainWindow::beginSceneEditSession(const QString& description, RenderWidget::SceneUpdateMode updateMode) {
-    if (!sceneEditSessionActive_) {
-        sceneEditSessionActive_ = true;
-        sceneEditBefore_ = scene_;
-        sceneEditBeforeSelection_ = currentSelectionToken();
-        sceneEditDescription_ = description;
-        sceneEditUpdateMode_ = updateMode;
-        return;
-    }
-
-    sceneEditUpdateMode_ = mergeUpdateMode(sceneEditUpdateMode_, updateMode);
+    document_->beginEditSession(description, updateMode, currentSelectionToken());
 }
 
 void MainWindow::commitSceneEditSession() {
-    if (!sceneEditSessionActive_) {
-        return;
-    }
-
-    const SceneConfig before = sceneEditBefore_;
-    const int beforeSelection = sceneEditBeforeSelection_;
-    const QString description = sceneEditDescription_;
-    const RenderWidget::SceneUpdateMode updateMode = sceneEditUpdateMode_;
-
-    sceneEditSessionActive_ = false;
-    sceneEditDescription_.clear();
-    sceneEditUpdateMode_ = RenderWidget::SceneUpdateMode::TransformsOnly;
-
-    if (sameScene(before, scene_)) {
-        dirty_ = !undoStack_->isClean();
-        updateWindowCaption();
-        return;
-    }
-
-    pushSceneCommand(before, scene_, beforeSelection, currentSelectionToken(), description, updateMode);
-    markSceneDirty(description);
+    document_->commitEditSession(currentSelectionToken());
 }
 
 void MainWindow::applySceneState(
@@ -1200,7 +999,9 @@ void MainWindow::applySceneState(
         selectedObjectIndices_.clear();
     } else if (selectionToken >= 0) {
         currentLightIndex_ = -1;
-        currentObjectIndex_ = clampSelectedIndex(scene_, selectionToken);
+        currentObjectIndex_ = scene_.objects.isEmpty()
+            ? -1
+            : qBound(0, selectionToken < 0 ? 0 : selectionToken, scene_.objects.size() - 1);
         selectedObjectIndices_ = currentObjectIndex_ >= 0 ? QVector<int>{currentObjectIndex_} : QVector<int>{};
     } else {
         currentLightIndex_ = -1;
@@ -1214,7 +1015,6 @@ void MainWindow::applySceneState(
     refreshToolsPanel();
     refreshObjectTree();
     applyingSceneState_ = false;
-    dirty_ = !undoStack_->isClean() || sceneEditSessionActive_;
     updateWindowCaption();
 }
 
@@ -1229,14 +1029,7 @@ void MainWindow::pushSceneCommand(
         return;
     }
 
-    undoStack_->push(new LambdaUndoCommand(
-        description,
-        [this, before, beforeSelection, updateMode]() {
-            applySceneState(before, beforeSelection, updateMode);
-        },
-        [this, after, afterSelection, updateMode]() {
-            applySceneState(after, afterSelection, updateMode);
-        }));
+    document_->pushSceneCommand(before, after, beforeSelection, afterSelection, description, updateMode);
 }
 
 void MainWindow::applyViewportTransformPreview(
@@ -1263,7 +1056,7 @@ void MainWindow::applyViewportTransformPreview(
     setVectorEditors(scaleEdits_, scale);
     syncingInspector_ = previousSyncState;
 
-    dirty_ = true;
+    document_->markDirty();
     updateWindowCaption();
 }
 
@@ -1297,7 +1090,7 @@ void MainWindow::applyViewportLightTransformPreview(
         }
     }
 
-    dirty_ = true;
+    document_->markDirty();
     updateWindowCaption();
 }
 
@@ -1370,23 +1163,13 @@ void MainWindow::addCubeObject() {
 
     const SceneConfig before = scene_;
     const int beforeSelection = currentSelectionToken();
-
-    RenderObjectConfig object;
-    object.id = scenegraph::generateObjectId();
-    object.name = scenegraph::uniqueObjectName(scene_, QStringLiteral("cube"));
-    if (!scene_.materials.isEmpty()) {
-        object.materialId = scene_.materials.constFirst().id;
-    }
-    if (currentObjectIndex_ >= 0 && currentObjectIndex_ < scene_.objects.size()) {
-        object.parentId = scene_.objects.at(currentObjectIndex_).parentId;
-        object.position = scene_.objects.at(currentObjectIndex_).position + QVector3D(1.5f, 0.0f, 0.0f);
+    const SceneEditResult result = SceneEditorService::addCube(&scene_, editorSelectionState());
+    if (!result.changed) {
+        return;
     }
 
-    scene_.objects.append(object);
-    currentObjectIndex_ = scene_.objects.size() - 1;
-    selectedObjectIndices_ = {currentObjectIndex_};
-    currentLightIndex_ = -1;
-    renderWidget_->setScene(scene_, RenderWidget::SceneUpdateMode::TransformsOnly);
+    applyEditorSelection(result.selection);
+    renderWidget_->setScene(scene_, toRenderUpdateMode(result.updateImpact));
     refreshObjectTree();
 
     pushSceneCommand(
@@ -1394,9 +1177,9 @@ void MainWindow::addCubeObject() {
         scene_,
         beforeSelection,
         currentSelectionToken(),
-        QStringLiteral("Added %1").arg(object.name),
-        RenderWidget::SceneUpdateMode::TransformsOnly);
-    markSceneDirty(QStringLiteral("Added %1").arg(object.name));
+        result.description,
+        toRenderUpdateMode(result.updateImpact));
+    markSceneDirty(result.description);
 }
 
 void MainWindow::addLight() {
@@ -1405,19 +1188,13 @@ void MainWindow::addLight() {
 
     const SceneConfig before = scene_;
     const int beforeSelection = currentSelectionToken();
-
-    LightConfig light;
-    if (currentLightIndex_ >= 0 && currentLightIndex_ < scene_.lights.size()) {
-        light = scene_.lights.at(currentLightIndex_);
-        light.position += QVector3D(1.5f, 1.0f, 0.0f);
+    const SceneEditResult result = SceneEditorService::addLight(&scene_, editorSelectionState());
+    if (!result.changed) {
+        return;
     }
-    light = sanitizeLight(light);
 
-    scene_.lights.append(light);
-    selectedObjectIndices_.clear();
-    currentObjectIndex_ = -1;
-    currentLightIndex_ = scene_.lights.size() - 1;
-    renderWidget_->setScene(scene_, RenderWidget::SceneUpdateMode::TransformsOnly);
+    applyEditorSelection(result.selection);
+    renderWidget_->setScene(scene_, toRenderUpdateMode(result.updateImpact));
     refreshObjectTree();
 
     pushSceneCommand(
@@ -1425,9 +1202,9 @@ void MainWindow::addLight() {
         scene_,
         beforeSelection,
         currentSelectionToken(),
-        QStringLiteral("Added %1").arg(lightDisplayName(light, currentLightIndex_)),
-        RenderWidget::SceneUpdateMode::TransformsOnly);
-    markSceneDirty(QStringLiteral("Added %1").arg(lightDisplayName(light, currentLightIndex_)));
+        result.description,
+        toRenderUpdateMode(result.updateImpact));
+    markSceneDirty(result.description);
 }
 
 void MainWindow::importModelObjects() {
@@ -1437,7 +1214,7 @@ void MainWindow::importModelObjects() {
     const QStringList files = QFileDialog::getOpenFileNames(
         this,
         QStringLiteral("Import Model"),
-        QFileInfo(scenePath_).absolutePath(),
+        QFileInfo(document_->scenePath()).absolutePath(),
         QStringLiteral("Model Files (*.obj *.gltf *.glb)"));
     if (files.isEmpty()) {
         return;
@@ -1511,26 +1288,16 @@ void MainWindow::duplicateSelectedObjects() {
     commitInspectorTransformEdits();
     commitLightEdits();
 
-    const QVector<int> selection = selectedObjectIndices_.isEmpty() && currentObjectIndex_ >= 0
-        ? QVector<int>{currentObjectIndex_}
-        : selectedObjectIndices_;
-    const QVector<int> roots = topLevelSelectedIndices(scene_, selection);
-    if (roots.isEmpty()) {
+    const SceneConfig before = scene_;
+    const int beforeSelection = currentSelectionToken();
+    const SceneEditResult result =
+        SceneEditorService::duplicateSelection(&scene_, editorSelectionState(), kDuplicateOffset);
+    if (!result.changed) {
         return;
     }
 
-    const SceneConfig before = scene_;
-    const int beforeSelection = currentSelectionToken();
-    const QVector<RenderObjectConfig> prototypes = collectClipboardObjects(scene_, roots, false);
-    const QVector<int> insertedIndices = appendClonedObjects(&scene_, prototypes, true, kDuplicateOffset);
-
-    currentObjectIndex_ = insertedIndices.isEmpty() ? -1 : insertedIndices.constLast();
-    selectedObjectIndices_ = insertedIndices;
-    currentLightIndex_ = -1;
-    const RenderWidget::SceneUpdateMode updateMode =
-        selectionIncludesModel(scene_, insertedIndices)
-            ? RenderWidget::SceneUpdateMode::ReloadResources
-            : RenderWidget::SceneUpdateMode::TransformsOnly;
+    applyEditorSelection(result.selection);
+    const RenderWidget::SceneUpdateMode updateMode = toRenderUpdateMode(result.updateImpact);
     renderWidget_->setScene(scene_, updateMode);
     refreshObjectTree();
 
@@ -1539,21 +1306,18 @@ void MainWindow::duplicateSelectedObjects() {
         scene_,
         beforeSelection,
         currentSelectionToken(),
-        QStringLiteral("Duplicated %1 object(s)").arg(roots.size()),
+        result.description,
         updateMode);
-    markSceneDirty(QStringLiteral("Duplicated %1 object(s)").arg(roots.size()));
+    markSceneDirty(result.description);
 }
 
 void MainWindow::copySelectedObjects() {
-    const QVector<int> selection = selectedObjectIndices_.isEmpty() && currentObjectIndex_ >= 0
-        ? QVector<int>{currentObjectIndex_}
-        : selectedObjectIndices_;
-    const QVector<int> roots = topLevelSelectedIndices(scene_, selection);
-    clipboardObjects_ = collectClipboardObjects(scene_, roots, true);
+    const SceneCopyResult copy = SceneEditorService::copySelection(scene_, editorSelectionState());
+    clipboardObjects_ = copy.clipboardObjects;
     statusBar()->showMessage(
         clipboardObjects_.isEmpty()
             ? QStringLiteral("Nothing copied")
-            : QStringLiteral("Copied %1 object(s)").arg(roots.size()),
+            : QStringLiteral("Copied %1 object(s)").arg(copy.rootCount),
         1500);
 }
 
@@ -1566,18 +1330,14 @@ void MainWindow::pasteObjects() {
 
     const SceneConfig before = scene_;
     const int beforeSelection = currentSelectionToken();
-    const QVector<int> insertedIndices = appendClonedObjects(&scene_, clipboardObjects_, false, kDuplicateOffset);
-    if (insertedIndices.isEmpty()) {
+    const SceneEditResult result =
+        SceneEditorService::pasteClipboard(&scene_, clipboardObjects_, kDuplicateOffset);
+    if (!result.changed) {
         return;
     }
 
-    currentObjectIndex_ = insertedIndices.constLast();
-    selectedObjectIndices_ = insertedIndices;
-    currentLightIndex_ = -1;
-    const RenderWidget::SceneUpdateMode updateMode =
-        selectionIncludesModel(scene_, insertedIndices)
-            ? RenderWidget::SceneUpdateMode::ReloadResources
-            : RenderWidget::SceneUpdateMode::TransformsOnly;
+    applyEditorSelection(result.selection);
+    const RenderWidget::SceneUpdateMode updateMode = toRenderUpdateMode(result.updateImpact);
     renderWidget_->setScene(scene_, updateMode);
     refreshObjectTree();
 
@@ -1586,9 +1346,9 @@ void MainWindow::pasteObjects() {
         scene_,
         beforeSelection,
         currentSelectionToken(),
-        QStringLiteral("Pasted %1 object(s)").arg(insertedIndices.size()),
+        result.description,
         updateMode);
-    markSceneDirty(QStringLiteral("Pasted %1 object(s)").arg(insertedIndices.size()));
+    markSceneDirty(result.description);
 }
 
 void MainWindow::deleteSelectedObjects() {
@@ -1599,27 +1359,15 @@ void MainWindow::deleteSelectedObjects() {
         return;
     }
 
-    const QVector<int> selection = selectedObjectIndices_.isEmpty() && currentObjectIndex_ >= 0
-        ? QVector<int>{currentObjectIndex_}
-        : selectedObjectIndices_;
-    const QVector<int> roots = topLevelSelectedIndices(scene_, selection);
-    if (roots.isEmpty()) {
+    const SceneConfig before = scene_;
+    const int beforeSelection = currentSelectionToken();
+    const SceneEditResult result = SceneEditorService::deleteSelection(&scene_, editorSelectionState());
+    if (!result.changed) {
         return;
     }
 
-    const QVector<int> removalIndices = collectSubtreeSelection(scene_, roots);
-    const SceneConfig before = scene_;
-    const int beforeSelection = currentSelectionToken();
-    QVector<int> descendingRemoval = removalIndices;
-    std::sort(descendingRemoval.begin(), descendingRemoval.end(), std::greater<int>());
-    for (int index : descendingRemoval) {
-        scene_.objects.removeAt(index);
-    }
-
-    currentObjectIndex_ = clampSelectedIndex(scene_, currentObjectIndex_);
-    selectedObjectIndices_ = currentObjectIndex_ >= 0 ? QVector<int>{currentObjectIndex_} : QVector<int>{};
-    currentLightIndex_ = -1;
-    renderWidget_->setScene(scene_, RenderWidget::SceneUpdateMode::TransformsOnly);
+    applyEditorSelection(result.selection);
+    renderWidget_->setScene(scene_, toRenderUpdateMode(result.updateImpact));
     refreshObjectTree();
 
     pushSceneCommand(
@@ -1627,28 +1375,24 @@ void MainWindow::deleteSelectedObjects() {
         scene_,
         beforeSelection,
         currentSelectionToken(),
-        QStringLiteral("Deleted %1 object(s)").arg(removalIndices.size()),
-        RenderWidget::SceneUpdateMode::TransformsOnly);
-    markSceneDirty(QStringLiteral("Deleted %1 object(s)").arg(removalIndices.size()));
+        result.description,
+        toRenderUpdateMode(result.updateImpact));
+    markSceneDirty(result.description);
 }
 
 void MainWindow::removeSelectedLight() {
     commitInspectorTransformEdits();
     commitLightEdits();
-    if (currentLightIndex_ < 0 || currentLightIndex_ >= scene_.lights.size() || scene_.lights.size() <= 1) {
-        return;
-    }
 
     const SceneConfig before = scene_;
     const int beforeSelection = currentSelectionToken();
-    const QString description =
-        QStringLiteral("Removed %1").arg(lightDisplayName(scene_.lights.at(currentLightIndex_), currentLightIndex_));
+    const SceneEditResult result = SceneEditorService::removeSelectedLight(&scene_, editorSelectionState());
+    if (!result.changed) {
+        return;
+    }
 
-    scene_.lights.removeAt(currentLightIndex_);
-    currentLightIndex_ = qBound(0, currentLightIndex_, scene_.lights.size() - 1);
-    selectedObjectIndices_.clear();
-    currentObjectIndex_ = -1;
-    renderWidget_->setScene(scene_, RenderWidget::SceneUpdateMode::TransformsOnly);
+    applyEditorSelection(result.selection);
+    renderWidget_->setScene(scene_, toRenderUpdateMode(result.updateImpact));
     refreshObjectTree();
 
     pushSceneCommand(
@@ -1656,9 +1400,9 @@ void MainWindow::removeSelectedLight() {
         scene_,
         beforeSelection,
         currentSelectionToken(),
-        description,
-        RenderWidget::SceneUpdateMode::TransformsOnly);
-    markSceneDirty(description);
+        result.description,
+        toRenderUpdateMode(result.updateImpact));
+    markSceneDirty(result.description);
 }
 
 bool MainWindow::saveScene() {
@@ -1667,11 +1411,11 @@ bool MainWindow::saveScene() {
     scenegraph::ensureObjectIds(&scene_);
 
     try {
-        SceneConfig::saveToFile(scene_, scenePath_);
-        undoStack_->setClean();
-        dirty_ = false;
+        document_->save();
         updateWindowCaption();
-        statusBar()->showMessage(QStringLiteral("Saved %1").arg(QFileInfo(scenePath_).fileName()), 3000);
+        statusBar()->showMessage(
+            QStringLiteral("Saved %1").arg(QFileInfo(document_->scenePath()).fileName()),
+            3000);
         return true;
     } catch (const std::exception& exception) {
         QMessageBox::critical(this, QStringLiteral("Save Error"), QString::fromUtf8(exception.what()));
@@ -1688,12 +1432,7 @@ void MainWindow::reloadScene() {
 
     try {
         const int selectionToken = currentSelectionToken();
-        scene_ = SceneConfig::loadFromFile(scenePath_);
-        scenegraph::ensureObjectIds(&scene_);
-        applySceneState(scene_, selectionToken, RenderWidget::SceneUpdateMode::ReloadResources, true);
-        undoStack_->clear();
-        undoStack_->setClean();
-        dirty_ = false;
+        document_->reload(selectionToken);
         updateWindowCaption();
         statusBar()->showMessage(QStringLiteral("Reloaded scene"), 3000);
     } catch (const std::exception& exception) {
@@ -1702,7 +1441,7 @@ void MainWindow::reloadScene() {
 }
 
 bool MainWindow::maybeSaveChanges(const QString& actionText) {
-    if (!dirty_ && !sceneEditSessionActive_) {
+    if (!document_->hasUnsavedChanges()) {
         return true;
     }
 
@@ -1724,15 +1463,33 @@ bool MainWindow::maybeSaveChanges(const QString& actionText) {
 }
 
 void MainWindow::updateWindowCaption() {
-    const QString dirtyMarker = dirty_ ? QStringLiteral(" *") : QString();
-    const QString fileName = QFileInfo(scenePath_).fileName();
-    setWindowTitle(QStringLiteral("%1%2 - %3").arg(scene_.window.title, dirtyMarker, fileName));
+    setWindowTitle(document_->windowCaption());
 }
 
 void MainWindow::markSceneDirty(const QString& reason) {
-    dirty_ = true;
+    document_->markDirty();
     updateWindowCaption();
     statusBar()->showMessage(reason, 1500);
+}
+
+SceneSelectionState MainWindow::editorSelectionState() const {
+    SceneSelectionState selectionState;
+    selectionState.selectedObjectIndices = selectedObjectIndices_;
+    selectionState.currentObjectIndex = currentObjectIndex_;
+    selectionState.currentLightIndex = currentLightIndex_;
+    return selectionState;
+}
+
+void MainWindow::applyEditorSelection(const SceneSelectionState& selectionState) {
+    selectedObjectIndices_ = selectionState.selectedObjectIndices;
+    currentObjectIndex_ = selectionState.currentObjectIndex;
+    currentLightIndex_ = selectionState.currentLightIndex;
+}
+
+RenderWidget::SceneUpdateMode MainWindow::toRenderUpdateMode(SceneUpdateImpact updateImpact) {
+    return updateImpact == SceneUpdateImpact::ReloadResources
+        ? RenderWidget::SceneUpdateMode::ReloadResources
+        : RenderWidget::SceneUpdateMode::TransformsOnly;
 }
 
 }  // namespace renderer

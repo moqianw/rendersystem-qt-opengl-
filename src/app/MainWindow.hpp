@@ -4,6 +4,7 @@
 #include <QVector>
 
 #include "app/RenderWidget.hpp"
+#include "app/SceneEditorService.hpp"
 
 class QCheckBox;
 class QCloseEvent;
@@ -16,7 +17,11 @@ class QLineEdit;
 class QListWidget;
 class QMenu;
 class QTreeWidget;
-class QUndoStack;
+class QWidget;
+
+namespace renderer {
+class SceneDocument;
+}
 
 namespace renderer {
 
@@ -103,13 +108,14 @@ private:
     bool maybeSaveChanges(const QString& actionText);
     void updateWindowCaption();
     void markSceneDirty(const QString& reason);
+    SceneSelectionState editorSelectionState() const;
+    void applyEditorSelection(const SceneSelectionState& selectionState);
+    static RenderWidget::SceneUpdateMode toRenderUpdateMode(SceneUpdateImpact updateImpact);
     int currentSelectionToken() const;
 
-    QString scenePath_;
     SceneConfig scene_;
-    SceneConfig sceneEditBefore_;
+    SceneDocument* document_ = nullptr;
     RenderWidget* renderWidget_ = nullptr;
-    QUndoStack* undoStack_ = nullptr;
     QDockWidget* sceneDock_ = nullptr;
     QDockWidget* inspectorDock_ = nullptr;
     QDockWidget* materialDock_ = nullptr;
@@ -148,16 +154,10 @@ private:
     bool syncingInspector_ = false;
     bool syncingLights_ = false;
     bool applyingSceneState_ = false;
-    bool sceneEditSessionActive_ = false;
-    bool dirty_ = false;
     int currentObjectIndex_ = -1;
     int currentLightIndex_ = -1;
     QVector<int> selectedObjectIndices_;
     QVector<RenderObjectConfig> clipboardObjects_;
-    int sceneEditBeforeSelection_ = -1;
-    RenderWidget::SceneUpdateMode sceneEditUpdateMode_ =
-        RenderWidget::SceneUpdateMode::TransformsOnly;
-    QString sceneEditDescription_;
 };
 
 }  // namespace renderer

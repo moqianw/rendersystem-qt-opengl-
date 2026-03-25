@@ -15,16 +15,15 @@
 #include <QListWidget>
 #include <QMenu>
 #include <QMenuBar>
-#include <QPushButton>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QStatusBar>
-#include <QToolBar>
-#include <QToolButton>
 #include <QTreeWidget>
 #include <QVBoxLayout>
 #include <QWidget>
 #include <QUndoStack>
+
+#include "app/SceneDocument.hpp"
 namespace {
 
 constexpr int kLayoutVersion = 1;
@@ -114,9 +113,9 @@ void MainWindow::createMenus() {
 
     populateAddResourceMenu(addMenu);
 
-    auto* undoAction = undoStack_->createUndoAction(this, QStringLiteral("Undo"));
+    auto* undoAction = document_->undoStack()->createUndoAction(this, QStringLiteral("Undo"));
     undoAction->setShortcut(QKeySequence::Undo);
-    auto* redoAction = undoStack_->createRedoAction(this, QStringLiteral("Redo"));
+    auto* redoAction = document_->undoStack()->createRedoAction(this, QStringLiteral("Redo"));
     redoAction->setShortcut(QKeySequence::Redo);
     editMenu->addAction(undoAction);
     editMenu->addAction(redoAction);
@@ -163,34 +162,6 @@ void MainWindow::createMenus() {
     panelsMenu->addAction(lightsDock_->toggleViewAction());
     panelsMenu->addAction(cameraDock_->toggleViewAction());
     panelsMenu->addAction(toolsDock_->toggleViewAction());
-
-    auto* toolbar = addToolBar(QStringLiteral("Scene"));
-    toolbar->setObjectName(QStringLiteral("SceneToolBar"));
-    toolbar->setMovable(false);
-    toolbar->addAction(saveAction);
-    toolbar->addAction(reloadAction);
-    toolbar->addSeparator();
-    toolbar->addAction(undoAction);
-    toolbar->addAction(redoAction);
-    toolbar->addAction(copyAction);
-    toolbar->addAction(pasteAction);
-    toolbar->addAction(duplicateAction);
-    toolbar->addSeparator();
-
-    auto* toolbarAddButton = new QToolButton(toolbar);
-    toolbarAddButton->setText(QStringLiteral("Add"));
-    toolbarAddButton->setPopupMode(QToolButton::InstantPopup);
-    auto* toolbarAddMenu = new QMenu(toolbarAddButton);
-    populateAddResourceMenu(toolbarAddMenu);
-    toolbarAddButton->setMenu(toolbarAddMenu);
-    toolbar->addWidget(toolbarAddButton);
-
-    toolbar->addAction(deleteAction);
-    toolbar->addSeparator();
-    toolbar->addAction(focusAction);
-    toolbar->addAction(resetAction);
-    toolbar->addSeparator();
-    toolbar->addAction(resetLayoutAction);
 }
 
 void MainWindow::createDocks() {
@@ -213,24 +184,9 @@ void MainWindow::createDocks() {
     sceneLayout->setContentsMargins(8, 8, 8, 8);
     sceneLayout->setSpacing(8);
 
-    auto* sceneToolbarRow = new QWidget(sceneWidget);
-    auto* sceneToolbarLayout = new QHBoxLayout(sceneToolbarRow);
-    sceneToolbarLayout->setContentsMargins(0, 0, 0, 0);
-    sceneToolbarLayout->setSpacing(8);
-
-    auto* addButton = new QToolButton(sceneToolbarRow);
-    addButton->setText(QStringLiteral("Add"));
-    addButton->setPopupMode(QToolButton::InstantPopup);
-    auto* addMenu = new QMenu(addButton);
-    populateAddResourceMenu(addMenu);
-    addButton->setMenu(addMenu);
-
-    auto* resourceLabel = new QLabel(QStringLiteral("Objects, models and lights"), sceneToolbarRow);
-    sceneToolbarLayout->addWidget(addButton);
-    sceneToolbarLayout->addWidget(resourceLabel);
-    sceneToolbarLayout->addStretch(1);
-
-    sceneLayout->addWidget(sceneToolbarRow);
+    auto* resourceLabel = new QLabel(QStringLiteral("Outliner for objects, imported models and lights."), sceneWidget);
+    resourceLabel->setWordWrap(true);
+    sceneLayout->addWidget(resourceLabel);
     sceneLayout->addWidget(objectTree_, 1);
     sceneDock_->setWidget(sceneWidget);
     addDockWidget(Qt::LeftDockWidgetArea, sceneDock_);
@@ -421,15 +377,6 @@ void MainWindow::createCameraPanel(QDockWidget* dock) {
     statusLayout->addRow(QStringLiteral("Target"), cameraTargetLabel_);
     statusLayout->addRow(QStringLiteral("Distance"), cameraDistanceLabel_);
 
-    auto* actionRow = new QWidget(panel);
-    auto* actionLayout = new QHBoxLayout(actionRow);
-    actionLayout->setContentsMargins(0, 0, 0, 0);
-    actionLayout->setSpacing(8);
-    auto* focusButton = new QPushButton(QStringLiteral("Frame Selection"), actionRow);
-    auto* resetButton = new QPushButton(QStringLiteral("Reset Camera"), actionRow);
-    actionLayout->addWidget(focusButton);
-    actionLayout->addWidget(resetButton);
-
     auto* helpLabel = new QLabel(
         QStringLiteral(
             "Controls\n"
@@ -448,12 +395,8 @@ void MainWindow::createCameraPanel(QDockWidget* dock) {
     helpLabel->setWordWrap(true);
 
     layout->addWidget(statusGroup);
-    layout->addWidget(actionRow);
     layout->addWidget(helpLabel);
     layout->addStretch(1);
-
-    connect(focusButton, &QPushButton::clicked, renderWidget_, &RenderWidget::focusOnSelectedObject);
-    connect(resetButton, &QPushButton::clicked, renderWidget_, &RenderWidget::resetCamera);
 
     dock->setWidget(panel);
 }
@@ -490,18 +433,8 @@ void MainWindow::createToolsPanel(QDockWidget* dock) {
     snapLayout->addRow(QStringLiteral("Rotate Step"), rotateSnapStepEdit_);
     snapLayout->addRow(QStringLiteral("Scale Step"), scaleSnapStepEdit_);
 
-    auto* layoutGroup = new QGroupBox(QStringLiteral("Windows"), panel);
-    auto* layoutButtons = new QVBoxLayout(layoutGroup);
-    layoutButtons->setContentsMargins(12, 12, 12, 12);
-    layoutButtons->setSpacing(8);
-    auto* restoreLayoutButton = new QPushButton(QStringLiteral("Restore Default Layout"), layoutGroup);
-    auto* showWindowsButton = new QPushButton(QStringLiteral("Show All Windows"), layoutGroup);
-    layoutButtons->addWidget(restoreLayoutButton);
-    layoutButtons->addWidget(showWindowsButton);
-
     layout->addWidget(transformGroup);
     layout->addWidget(snapGroup);
-    layout->addWidget(layoutGroup);
     layout->addStretch(1);
 
     connect(transformModeCombo_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int index) {
@@ -592,9 +525,6 @@ void MainWindow::createToolsPanel(QDockWidget* dock) {
             markSceneDirty(QStringLiteral("Updated scale snap step"));
         }
     });
-    connect(restoreLayoutButton, &QPushButton::clicked, this, &MainWindow::restoreDefaultLayout);
-    connect(showWindowsButton, &QPushButton::clicked, this, &MainWindow::showAllPanels);
-
     dock->setWidget(panel);
 }
 
