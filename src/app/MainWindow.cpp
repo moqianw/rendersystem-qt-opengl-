@@ -48,6 +48,13 @@ constexpr int kLayoutVersion = 1;
 const char kSettingsOrganization[] = "OpenGLStudy";
 const char kSettingsApplication[] = "QtRendererEditor";
 const QVector3D kDuplicateOffset(1.5f, 0.0f, 1.5f);
+constexpr int kSceneTreeItemTypeRole = Qt::UserRole;
+constexpr int kSceneTreeItemIndexRole = Qt::UserRole + 1;
+
+enum class SceneTreeItemType {
+    Object = 1,
+    Light = 2
+};
 
 QString geometryLabel(renderer::GeometryType geometry) {
     switch (geometry) {
@@ -82,6 +89,14 @@ QString objectDisplayName(const renderer::RenderObjectConfig& object, int index)
 
 QString lightDisplayName(const renderer::LightConfig& light, int index) {
     return QStringLiteral("%1. %2 Light").arg(index + 1).arg(lightTypeLabel(light.type));
+}
+
+int lightSelectionToken(int lightIndex) {
+    return -2 - lightIndex;
+}
+
+int lightIndexFromSelectionToken(int selectionToken) {
+    return selectionToken <= -2 ? (-selectionToken) - 2 : -1;
 }
 
 QString uniqueMaterialId(const renderer::SceneConfig& scene, const QString& baseName) {
@@ -624,6 +639,8 @@ MainWindow::MainWindow(const SceneConfig& scene, const QString& scenePath, QWidg
     renderWidget_->resetCamera();
     if (!scene_.objects.isEmpty()) {
         setSelectionState({0}, 0);
+    } else if (!scene_.lights.isEmpty()) {
+        setLightSelectionState(0);
     } else {
         updateCameraPanel(scene_.camera.position, scene_.camera.position + QVector3D(0.0f, 0.0f, -10.0f), 10.0f);
     }
@@ -698,6 +715,10 @@ void MainWindow::createMenus() {
         addCubeObject();
     });
 
+    auto* addLightAction = editMenu->addAction(QStringLiteral("Add Light"));
+    addLightAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+Shift+N")));
+    connect(addLightAction, &QAction::triggered, this, &MainWindow::addLight);
+
     auto* deleteAction = editMenu->addAction(QStringLiteral("Delete Selected"));
     deleteAction->setShortcut(QKeySequence::Delete);
     connect(deleteAction, &QAction::triggered, this, [this]() {
@@ -739,6 +760,7 @@ void MainWindow::createMenus() {
     toolbar->addAction(duplicateAction);
     toolbar->addSeparator();
     toolbar->addAction(addAction);
+    toolbar->addAction(addLightAction);
     toolbar->addAction(deleteAction);
     toolbar->addSeparator();
     toolbar->addAction(focusAction);
@@ -864,18 +886,6 @@ void MainWindow::createLightsPanel(QDockWidget* dock) {
     layout->setContentsMargins(12, 12, 12, 12);
     layout->setSpacing(10);
 
-    lightList_ = new QListWidget(panel);
-    lightList_->setSelectionMode(QAbstractItemView::SingleSelection);
-
-    auto* actionsRow = new QWidget(panel);
-    auto* actionsLayout = new QHBoxLayout(actionsRow);
-    actionsLayout->setContentsMargins(0, 0, 0, 0);
-    actionsLayout->setSpacing(8);
-    addLightButton_ = new QPushButton(QStringLiteral("Add Light"), actionsRow);
-    removeLightButton_ = new QPushButton(QStringLiteral("Remove Light"), actionsRow);
-    actionsLayout->addWidget(addLightButton_);
-    actionsLayout->addWidget(removeLightButton_);
-
     auto* lightGroup = new QGroupBox(QStringLiteral("Light"), panel);
     auto* lightLayout = new QFormLayout(lightGroup);
     lightTypeCombo_ = new QComboBox(lightGroup);
@@ -912,16 +922,8 @@ void MainWindow::createLightsPanel(QDockWidget* dock) {
     lightLayout->addRow(QStringLiteral("Inner Cone"), lightInnerConeEdit_);
     lightLayout->addRow(QStringLiteral("Outer Cone"), lightOuterConeEdit_);
 
-    layout->addWidget(lightList_);
-    layout->addWidget(actionsRow);
     layout->addWidget(lightGroup);
     layout->addStretch(1);
-
-    connect(lightList_, &QListWidget::currentRowChanged, this, [this](int) {
-        handleLightSelectionChanged();
-    });
-    connect(addLightButton_, &QPushButton::clicked, this, &MainWindow::addLight);
-    connect(removeLightButton_, &QPushButton::clicked, this, &MainWindow::removeSelectedLight);
     connect(lightTypeCombo_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int) {
         if (syncingLights_ || applyingSceneState_) {
             return;
@@ -1077,8 +1079,8 @@ void MainWindow::createToolsPanel(QDockWidget* dock) {
             pushSceneCommand(
                 before,
                 scene_,
-                currentObjectIndex_,
-                currentObjectIndex_,
+                currentSelectionToken(),
+                currentSelectionToken(),
                 QStringLiteral("Updated snap mode"),
                 RenderWidget::SceneUpdateMode::TransformsOnly);
             markSceneDirty(QStringLiteral("Updated snap mode"));
@@ -1097,8 +1099,8 @@ void MainWindow::createToolsPanel(QDockWidget* dock) {
             pushSceneCommand(
                 before,
                 scene_,
-                currentObjectIndex_,
-                currentObjectIndex_,
+                currentSelectionToken(),
+                currentSelectionToken(),
                 QStringLiteral("Updated move snap step"),
                 RenderWidget::SceneUpdateMode::ReloadResources);
             markSceneDirty(QStringLiteral("Updated move snap step"));
@@ -1115,8 +1117,8 @@ void MainWindow::createToolsPanel(QDockWidget* dock) {
             pushSceneCommand(
                 before,
                 scene_,
-                currentObjectIndex_,
-                currentObjectIndex_,
+                currentSelectionToken(),
+                currentSelectionToken(),
                 QStringLiteral("Updated rotate snap step"),
                 RenderWidget::SceneUpdateMode::TransformsOnly);
             markSceneDirty(QStringLiteral("Updated rotate snap step"));
@@ -1133,8 +1135,8 @@ void MainWindow::createToolsPanel(QDockWidget* dock) {
             pushSceneCommand(
                 before,
                 scene_,
-                currentObjectIndex_,
-                currentObjectIndex_,
+                currentSelectionToken(),
+                currentSelectionToken(),
                 QStringLiteral("Updated scale snap step"),
                 RenderWidget::SceneUpdateMode::TransformsOnly);
             markSceneDirty(QStringLiteral("Updated scale snap step"));
@@ -1219,7 +1221,8 @@ void MainWindow::refreshObjectTree() {
         const RenderObjectConfig& object = scene_.objects.at(objectIndex);
         auto* item = new QTreeWidgetItem;
         item->setText(0, objectDisplayName(object, objectIndex));
-        item->setData(0, Qt::UserRole, objectIndex);
+        item->setData(0, kSceneTreeItemTypeRole, static_cast<int>(SceneTreeItemType::Object));
+        item->setData(0, kSceneTreeItemIndexRole, objectIndex);
         item->setToolTip(
             0,
             QStringLiteral("id: %1\nparent: %2\nsource: %3")
@@ -1240,8 +1243,30 @@ void MainWindow::refreshObjectTree() {
         appendItem(nullptr, rootIndex);
     }
 
+    if (!scene_.lights.isEmpty()) {
+        auto* lightsRoot = new QTreeWidgetItem;
+        lightsRoot->setText(0, QStringLiteral("Lights"));
+        lightsRoot->setFlags(lightsRoot->flags() & ~Qt::ItemIsSelectable);
+        objectTree_->addTopLevelItem(lightsRoot);
+
+        for (int lightIndex = 0; lightIndex < scene_.lights.size(); ++lightIndex) {
+            auto* lightItem = new QTreeWidgetItem(lightsRoot);
+            lightItem->setText(0, lightDisplayName(scene_.lights.at(lightIndex), lightIndex));
+            lightItem->setData(0, kSceneTreeItemTypeRole, static_cast<int>(SceneTreeItemType::Light));
+            lightItem->setData(0, kSceneTreeItemIndexRole, lightIndex);
+            lightItem->setToolTip(
+                0,
+                QStringLiteral("type: %1\nposition: %2")
+                    .arg(lightTypeLabel(scene_.lights.at(lightIndex).type), formatVector(scene_.lights.at(lightIndex).position)));
+        }
+    }
+
     objectTree_->expandAll();
-    setSelectionState(selectedObjectIndices_, currentObjectIndex_);
+    if (currentLightIndex_ >= 0 && currentLightIndex_ < scene_.lights.size()) {
+        setLightSelectionState(currentLightIndex_);
+    } else {
+        setSelectionState(selectedObjectIndices_, currentObjectIndex_);
+    }
 }
 
 void MainWindow::refreshMaterialList() {
@@ -1272,29 +1297,9 @@ void MainWindow::refreshMaterialList() {
 }
 
 void MainWindow::refreshLightsPanel() {
-    if (!lightList_) {
-        return;
+    if (currentLightIndex_ >= scene_.lights.size()) {
+        currentLightIndex_ = scene_.lights.isEmpty() ? -1 : (scene_.lights.size() - 1);
     }
-
-    if (scene_.lights.isEmpty()) {
-        currentLightIndex_ = -1;
-    } else {
-        currentLightIndex_ = qBound(0, currentLightIndex_ < 0 ? 0 : currentLightIndex_, scene_.lights.size() - 1);
-    }
-
-    syncingLights_ = true;
-    {
-        QSignalBlocker blocker(lightList_);
-        lightList_->clear();
-        for (int index = 0; index < scene_.lights.size(); ++index) {
-            lightList_->addItem(lightDisplayName(scene_.lights.at(index), index));
-        }
-        if (currentLightIndex_ >= 0) {
-            lightList_->setCurrentRow(currentLightIndex_);
-        }
-    }
-    syncingLights_ = false;
-
     refreshLightInspector();
 }
 
@@ -1307,12 +1312,6 @@ void MainWindow::refreshLightInspector() {
     syncingLights_ = true;
 
     lightTypeCombo_->setEnabled(hasLight);
-    if (addLightButton_) {
-        addLightButton_->setEnabled(true);
-    }
-    if (removeLightButton_) {
-        removeLightButton_->setEnabled(hasLight && scene_.lights.size() > 1);
-    }
 
     for (int index = 0; index < 3; ++index) {
         lightPositionEdits_[index]->setEnabled(hasLight);
@@ -1416,6 +1415,7 @@ void MainWindow::setSelectionState(const QVector<int>& indices, int currentIndex
 
     selectedObjectIndices_ = normalized;
     currentObjectIndex_ = nextCurrent;
+    currentLightIndex_ = -1;
 
     if (objectTree_) {
         QSignalBlocker blocker(objectTree_);
@@ -1423,7 +1423,10 @@ void MainWindow::setSelectionState(const QVector<int>& indices, int currentIndex
         QTreeWidgetItem* currentItem = nullptr;
         for (QTreeWidgetItemIterator it(objectTree_); *it; ++it) {
             auto* item = *it;
-            const int itemIndex = item->data(0, Qt::UserRole).toInt();
+            if (item->data(0, kSceneTreeItemTypeRole).toInt() != static_cast<int>(SceneTreeItemType::Object)) {
+                continue;
+            }
+            const int itemIndex = item->data(0, kSceneTreeItemIndexRole).toInt();
             if (selectedObjectIndices_.contains(itemIndex)) {
                 item->setSelected(true);
             }
@@ -1436,6 +1439,7 @@ void MainWindow::setSelectionState(const QVector<int>& indices, int currentIndex
 
     renderWidget_->setSelection(selectedObjectIndices_, currentObjectIndex_);
     refreshInspector();
+    refreshLightInspector();
 
     if (selectedObjectIndices_.isEmpty()) {
         statusBar()->showMessage(QStringLiteral("Selection cleared"), 1500);
@@ -1450,33 +1454,90 @@ void MainWindow::setSelectionState(const QVector<int>& indices, int currentIndex
     }
 }
 
-void MainWindow::handleObjectTreeSelectionChanged() {
-    QVector<int> indices;
-    for (QTreeWidgetItem* item : objectTree_->selectedItems()) {
-        indices.append(item->data(0, Qt::UserRole).toInt());
+void MainWindow::setLightSelectionState(int currentIndex) {
+    currentLightIndex_ =
+        currentIndex >= 0 && currentIndex < scene_.lights.size() ? currentIndex : -1;
+    selectedObjectIndices_.clear();
+    currentObjectIndex_ = -1;
+
+    if (objectTree_) {
+        QSignalBlocker blocker(objectTree_);
+        objectTree_->clearSelection();
+        QTreeWidgetItem* currentItem = nullptr;
+        for (QTreeWidgetItemIterator it(objectTree_); *it; ++it) {
+            auto* item = *it;
+            if (item->data(0, kSceneTreeItemTypeRole).toInt() != static_cast<int>(SceneTreeItemType::Light)) {
+                continue;
+            }
+
+            const int itemIndex = item->data(0, kSceneTreeItemIndexRole).toInt();
+            if (itemIndex == currentLightIndex_) {
+                item->setSelected(true);
+                currentItem = item;
+            }
+        }
+        objectTree_->setCurrentItem(currentItem);
     }
 
-    int currentIndex = -1;
-    if (QTreeWidgetItem* currentItem = objectTree_->currentItem()) {
-        currentIndex = currentItem->data(0, Qt::UserRole).toInt();
-    }
-
-    setSelectionState(indices, currentIndex);
-}
-
-void MainWindow::handleLightSelectionChanged() {
-    if (syncingLights_) {
-        return;
-    }
-
-    currentLightIndex_ = lightList_ ? lightList_->currentRow() : -1;
+    renderWidget_->setSelection({}, -1);
+    refreshInspector();
     refreshLightInspector();
 
     if (currentLightIndex_ >= 0 && currentLightIndex_ < scene_.lights.size()) {
         statusBar()->showMessage(
             QStringLiteral("Selected %1").arg(lightDisplayName(scene_.lights.at(currentLightIndex_), currentLightIndex_)),
             1500);
+    } else {
+        statusBar()->showMessage(QStringLiteral("Selection cleared"), 1500);
     }
+}
+
+int MainWindow::currentSelectionToken() const {
+    if (currentLightIndex_ >= 0 && currentLightIndex_ < scene_.lights.size()) {
+        return lightSelectionToken(currentLightIndex_);
+    }
+    if (currentObjectIndex_ >= 0 && currentObjectIndex_ < scene_.objects.size()) {
+        return currentObjectIndex_;
+    }
+    return -1;
+}
+
+void MainWindow::handleObjectTreeSelectionChanged() {
+    QVector<int> indices;
+    QVector<int> lightIndices;
+    for (QTreeWidgetItem* item : objectTree_->selectedItems()) {
+        const SceneTreeItemType itemType =
+            static_cast<SceneTreeItemType>(item->data(0, kSceneTreeItemTypeRole).toInt());
+        const int itemIndex = item->data(0, kSceneTreeItemIndexRole).toInt();
+        if (itemType == SceneTreeItemType::Object) {
+            indices.append(itemIndex);
+        } else if (itemType == SceneTreeItemType::Light) {
+            lightIndices.append(itemIndex);
+        }
+    }
+
+    int currentIndex = -1;
+    int currentLightIndex = -1;
+    if (QTreeWidgetItem* currentItem = objectTree_->currentItem()) {
+        const SceneTreeItemType currentType =
+            static_cast<SceneTreeItemType>(currentItem->data(0, kSceneTreeItemTypeRole).toInt());
+        const int itemIndex = currentItem->data(0, kSceneTreeItemIndexRole).toInt();
+        if (currentType == SceneTreeItemType::Object) {
+            currentIndex = itemIndex;
+        } else if (currentType == SceneTreeItemType::Light) {
+            currentLightIndex = itemIndex;
+        }
+    }
+
+    if (!lightIndices.isEmpty()) {
+        if (currentLightIndex < 0 || !lightIndices.contains(currentLightIndex)) {
+            currentLightIndex = lightIndices.constLast();
+        }
+        setLightSelectionState(currentLightIndex);
+        return;
+    }
+
+    setSelectionState(indices, currentIndex);
 }
 
 void MainWindow::refreshInspector() {
@@ -1547,9 +1608,13 @@ void MainWindow::previewLightEdits() {
 
     renderWidget_->setScene(scene_, RenderWidget::SceneUpdateMode::TransformsOnly);
     renderWidget_->setSelection(selectedObjectIndices_, currentObjectIndex_);
-    if (lightList_ && currentLightIndex_ < lightList_->count()) {
-        lightList_->item(currentLightIndex_)->setText(
-            lightDisplayName(scene_.lights.at(currentLightIndex_), currentLightIndex_));
+    if (objectTree_) {
+        QTreeWidgetItem* currentItem = objectTree_->currentItem();
+        if (currentItem &&
+            currentItem->data(0, kSceneTreeItemTypeRole).toInt() == static_cast<int>(SceneTreeItemType::Light) &&
+            currentItem->data(0, kSceneTreeItemIndexRole).toInt() == currentLightIndex_) {
+            currentItem->setText(0, lightDisplayName(scene_.lights.at(currentLightIndex_), currentLightIndex_));
+        }
     }
     markSceneDirty(QStringLiteral("Updated %1").arg(lightDisplayName(scene_.lights.at(currentLightIndex_), currentLightIndex_)));
 }
@@ -1599,7 +1664,7 @@ void MainWindow::applyInspectorMetadataEdits() {
     commitLightEdits();
 
     const SceneConfig before = scene_;
-    const int beforeSelection = currentObjectIndex_;
+    const int beforeSelection = currentSelectionToken();
     RenderObjectConfig& object = scene_.objects[currentObjectIndex_];
 
     QString objectName = nameEdit_->text().trimmed();
@@ -1622,7 +1687,7 @@ void MainWindow::applyInspectorMetadataEdits() {
             before,
             scene_,
             beforeSelection,
-            currentObjectIndex_,
+            currentSelectionToken(),
             QStringLiteral("Updated %1").arg(object.name),
             RenderWidget::SceneUpdateMode::TransformsOnly);
         markSceneDirty(QStringLiteral("Updated %1").arg(object.name));
@@ -1633,7 +1698,7 @@ void MainWindow::beginSceneEditSession(const QString& description, RenderWidget:
     if (!sceneEditSessionActive_) {
         sceneEditSessionActive_ = true;
         sceneEditBefore_ = scene_;
-        sceneEditBeforeSelection_ = currentObjectIndex_;
+        sceneEditBeforeSelection_ = currentSelectionToken();
         sceneEditDescription_ = description;
         sceneEditUpdateMode_ = updateMode;
         return;
@@ -1662,13 +1727,13 @@ void MainWindow::commitSceneEditSession() {
         return;
     }
 
-    pushSceneCommand(before, scene_, beforeSelection, currentObjectIndex_, description, updateMode);
+    pushSceneCommand(before, scene_, beforeSelection, currentSelectionToken(), description, updateMode);
     markSceneDirty(description);
 }
 
 void MainWindow::applySceneState(
     const SceneConfig& scene,
-    int selectedObjectIndex,
+    int selectionToken,
     RenderWidget::SceneUpdateMode updateMode,
     bool resetCamera) {
     applyingSceneState_ = true;
@@ -1676,9 +1741,23 @@ void MainWindow::applySceneState(
     for (LightConfig& light : scene_.lights) {
         light = sanitizeLight(light);
     }
-    currentObjectIndex_ = clampSelectedIndex(scene_, selectedObjectIndex);
-    selectedObjectIndices_ = currentObjectIndex_ >= 0 ? QVector<int>{currentObjectIndex_} : QVector<int>{};
     scenegraph::ensureObjectIds(&scene_);
+
+    const int selectedLightIndex = lightIndexFromSelectionToken(selectionToken);
+    if (selectedLightIndex >= 0 && selectedLightIndex < scene_.lights.size()) {
+        currentLightIndex_ = selectedLightIndex;
+        currentObjectIndex_ = -1;
+        selectedObjectIndices_.clear();
+    } else if (selectionToken >= 0) {
+        currentLightIndex_ = -1;
+        currentObjectIndex_ = clampSelectedIndex(scene_, selectionToken);
+        selectedObjectIndices_ = currentObjectIndex_ >= 0 ? QVector<int>{currentObjectIndex_} : QVector<int>{};
+    } else {
+        currentLightIndex_ = -1;
+        currentObjectIndex_ = -1;
+        selectedObjectIndices_.clear();
+    }
+
     renderWidget_->setScene(scene_, updateMode, resetCamera);
     refreshMaterialList();
     refreshLightsPanel();
@@ -1790,7 +1869,7 @@ void MainWindow::addCubeObject() {
     commitLightEdits();
 
     const SceneConfig before = scene_;
-    const int beforeSelection = currentObjectIndex_;
+    const int beforeSelection = currentSelectionToken();
 
     RenderObjectConfig object;
     object.id = scenegraph::generateObjectId();
@@ -1806,6 +1885,7 @@ void MainWindow::addCubeObject() {
     scene_.objects.append(object);
     currentObjectIndex_ = scene_.objects.size() - 1;
     selectedObjectIndices_ = {currentObjectIndex_};
+    currentLightIndex_ = -1;
     renderWidget_->setScene(scene_, RenderWidget::SceneUpdateMode::TransformsOnly);
     refreshObjectTree();
 
@@ -1813,7 +1893,7 @@ void MainWindow::addCubeObject() {
         before,
         scene_,
         beforeSelection,
-        currentObjectIndex_,
+        currentSelectionToken(),
         QStringLiteral("Added %1").arg(object.name),
         RenderWidget::SceneUpdateMode::TransformsOnly);
     markSceneDirty(QStringLiteral("Added %1").arg(object.name));
@@ -1824,7 +1904,7 @@ void MainWindow::addLight() {
     commitLightEdits();
 
     const SceneConfig before = scene_;
-    const int beforeSelection = currentObjectIndex_;
+    const int beforeSelection = currentSelectionToken();
 
     LightConfig light;
     if (currentLightIndex_ >= 0 && currentLightIndex_ < scene_.lights.size()) {
@@ -1834,16 +1914,17 @@ void MainWindow::addLight() {
     light = sanitizeLight(light);
 
     scene_.lights.append(light);
+    selectedObjectIndices_.clear();
+    currentObjectIndex_ = -1;
     currentLightIndex_ = scene_.lights.size() - 1;
     renderWidget_->setScene(scene_, RenderWidget::SceneUpdateMode::TransformsOnly);
-    renderWidget_->setSelection(selectedObjectIndices_, currentObjectIndex_);
-    refreshLightsPanel();
+    refreshObjectTree();
 
     pushSceneCommand(
         before,
         scene_,
         beforeSelection,
-        currentObjectIndex_,
+        currentSelectionToken(),
         QStringLiteral("Added %1").arg(lightDisplayName(light, currentLightIndex_)),
         RenderWidget::SceneUpdateMode::TransformsOnly);
     markSceneDirty(QStringLiteral("Added %1").arg(lightDisplayName(light, currentLightIndex_)));
@@ -1863,7 +1944,7 @@ void MainWindow::importModelObjects() {
     }
 
     const SceneConfig before = scene_;
-    const int beforeSelection = currentObjectIndex_;
+    const int beforeSelection = currentSelectionToken();
     QVector<int> insertedIndices;
 
     for (int fileIndex = 0; fileIndex < files.size(); ++fileIndex) {
@@ -1911,6 +1992,7 @@ void MainWindow::importModelObjects() {
 
     currentObjectIndex_ = insertedIndices.constLast();
     selectedObjectIndices_ = insertedIndices;
+    currentLightIndex_ = -1;
     renderWidget_->setScene(scene_, RenderWidget::SceneUpdateMode::ReloadResources);
     refreshMaterialList();
     refreshObjectTree();
@@ -1919,7 +2001,7 @@ void MainWindow::importModelObjects() {
         before,
         scene_,
         beforeSelection,
-        currentObjectIndex_,
+        currentSelectionToken(),
         QStringLiteral("Imported %1 model(s)").arg(insertedIndices.size()),
         RenderWidget::SceneUpdateMode::ReloadResources);
     markSceneDirty(QStringLiteral("Imported %1 model(s)").arg(insertedIndices.size()));
@@ -1938,12 +2020,13 @@ void MainWindow::duplicateSelectedObjects() {
     }
 
     const SceneConfig before = scene_;
-    const int beforeSelection = currentObjectIndex_;
+    const int beforeSelection = currentSelectionToken();
     const QVector<RenderObjectConfig> prototypes = collectClipboardObjects(scene_, roots, false);
     const QVector<int> insertedIndices = appendClonedObjects(&scene_, prototypes, true, kDuplicateOffset);
 
     currentObjectIndex_ = insertedIndices.isEmpty() ? -1 : insertedIndices.constLast();
     selectedObjectIndices_ = insertedIndices;
+    currentLightIndex_ = -1;
     const RenderWidget::SceneUpdateMode updateMode =
         selectionIncludesModel(scene_, insertedIndices)
             ? RenderWidget::SceneUpdateMode::ReloadResources
@@ -1955,7 +2038,7 @@ void MainWindow::duplicateSelectedObjects() {
         before,
         scene_,
         beforeSelection,
-        currentObjectIndex_,
+        currentSelectionToken(),
         QStringLiteral("Duplicated %1 object(s)").arg(roots.size()),
         updateMode);
     markSceneDirty(QStringLiteral("Duplicated %1 object(s)").arg(roots.size()));
@@ -1982,7 +2065,7 @@ void MainWindow::pasteObjects() {
     }
 
     const SceneConfig before = scene_;
-    const int beforeSelection = currentObjectIndex_;
+    const int beforeSelection = currentSelectionToken();
     const QVector<int> insertedIndices = appendClonedObjects(&scene_, clipboardObjects_, false, kDuplicateOffset);
     if (insertedIndices.isEmpty()) {
         return;
@@ -1990,6 +2073,7 @@ void MainWindow::pasteObjects() {
 
     currentObjectIndex_ = insertedIndices.constLast();
     selectedObjectIndices_ = insertedIndices;
+    currentLightIndex_ = -1;
     const RenderWidget::SceneUpdateMode updateMode =
         selectionIncludesModel(scene_, insertedIndices)
             ? RenderWidget::SceneUpdateMode::ReloadResources
@@ -2001,7 +2085,7 @@ void MainWindow::pasteObjects() {
         before,
         scene_,
         beforeSelection,
-        currentObjectIndex_,
+        currentSelectionToken(),
         QStringLiteral("Pasted %1 object(s)").arg(insertedIndices.size()),
         updateMode);
     markSceneDirty(QStringLiteral("Pasted %1 object(s)").arg(insertedIndices.size()));
@@ -2010,6 +2094,11 @@ void MainWindow::pasteObjects() {
 void MainWindow::deleteSelectedObjects() {
     commitInspectorTransformEdits();
     commitLightEdits();
+    if (currentLightIndex_ >= 0 && currentLightIndex_ < scene_.lights.size()) {
+        removeSelectedLight();
+        return;
+    }
+
     const QVector<int> selection = selectedObjectIndices_.isEmpty() && currentObjectIndex_ >= 0
         ? QVector<int>{currentObjectIndex_}
         : selectedObjectIndices_;
@@ -2020,7 +2109,7 @@ void MainWindow::deleteSelectedObjects() {
 
     const QVector<int> removalIndices = collectSubtreeSelection(scene_, roots);
     const SceneConfig before = scene_;
-    const int beforeSelection = currentObjectIndex_;
+    const int beforeSelection = currentSelectionToken();
     QVector<int> descendingRemoval = removalIndices;
     std::sort(descendingRemoval.begin(), descendingRemoval.end(), std::greater<int>());
     for (int index : descendingRemoval) {
@@ -2029,6 +2118,7 @@ void MainWindow::deleteSelectedObjects() {
 
     currentObjectIndex_ = clampSelectedIndex(scene_, currentObjectIndex_);
     selectedObjectIndices_ = currentObjectIndex_ >= 0 ? QVector<int>{currentObjectIndex_} : QVector<int>{};
+    currentLightIndex_ = -1;
     renderWidget_->setScene(scene_, RenderWidget::SceneUpdateMode::TransformsOnly);
     refreshObjectTree();
 
@@ -2036,7 +2126,7 @@ void MainWindow::deleteSelectedObjects() {
         before,
         scene_,
         beforeSelection,
-        currentObjectIndex_,
+        currentSelectionToken(),
         QStringLiteral("Deleted %1 object(s)").arg(removalIndices.size()),
         RenderWidget::SceneUpdateMode::TransformsOnly);
     markSceneDirty(QStringLiteral("Deleted %1 object(s)").arg(removalIndices.size()));
@@ -2050,21 +2140,22 @@ void MainWindow::removeSelectedLight() {
     }
 
     const SceneConfig before = scene_;
-    const int beforeSelection = currentObjectIndex_;
+    const int beforeSelection = currentSelectionToken();
     const QString description =
         QStringLiteral("Removed %1").arg(lightDisplayName(scene_.lights.at(currentLightIndex_), currentLightIndex_));
 
     scene_.lights.removeAt(currentLightIndex_);
     currentLightIndex_ = qBound(0, currentLightIndex_, scene_.lights.size() - 1);
+    selectedObjectIndices_.clear();
+    currentObjectIndex_ = -1;
     renderWidget_->setScene(scene_, RenderWidget::SceneUpdateMode::TransformsOnly);
-    renderWidget_->setSelection(selectedObjectIndices_, currentObjectIndex_);
-    refreshLightsPanel();
+    refreshObjectTree();
 
     pushSceneCommand(
         before,
         scene_,
         beforeSelection,
-        currentObjectIndex_,
+        currentSelectionToken(),
         description,
         RenderWidget::SceneUpdateMode::TransformsOnly);
     markSceneDirty(description);
@@ -2096,10 +2187,10 @@ void MainWindow::reloadScene() {
     }
 
     try {
+        const int selectionToken = currentSelectionToken();
         scene_ = SceneConfig::loadFromFile(scenePath_);
         scenegraph::ensureObjectIds(&scene_);
-        currentObjectIndex_ = clampSelectedIndex(scene_, 0);
-        applySceneState(scene_, currentObjectIndex_, RenderWidget::SceneUpdateMode::ReloadResources, true);
+        applySceneState(scene_, selectionToken, RenderWidget::SceneUpdateMode::ReloadResources, true);
         undoStack_->clear();
         undoStack_->setClean();
         dirty_ = false;

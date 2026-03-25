@@ -13,7 +13,6 @@ class QDoubleSpinBox;
 class QLabel;
 class QLineEdit;
 class QListWidget;
-class QPushButton;
 class QTreeWidget;
 class QUndoStack;
 
@@ -42,8 +41,8 @@ private:
     void refreshLightInspector();
     void refreshToolsPanel();
     void setSelectionState(const QVector<int>& indices, int currentIndex);
+    void setLightSelectionState(int currentIndex);
     void handleObjectTreeSelectionChanged();
-    void handleLightSelectionChanged();
     void refreshInspector();
     void previewLightEdits();
     void commitLightEdits();
@@ -54,7 +53,7 @@ private:
     void commitSceneEditSession();
     void applySceneState(
         const SceneConfig& scene,
-        int selectedObjectIndex,
+        int selectionToken,
         RenderWidget::SceneUpdateMode updateMode,
         bool resetCamera = false);
     void pushSceneCommand(
@@ -91,6 +90,7 @@ private:
     bool maybeSaveChanges(const QString& actionText);
     void updateWindowCaption();
     void markSceneDirty(const QString& reason);
+    int currentSelectionToken() const;
 
     QString scenePath_;
     SceneConfig scene_;
@@ -105,9 +105,6 @@ private:
     QDockWidget* toolsDock_ = nullptr;
     QTreeWidget* objectTree_ = nullptr;
     QListWidget* materialList_ = nullptr;
-    QListWidget* lightList_ = nullptr;
-    QPushButton* addLightButton_ = nullptr;
-    QPushButton* removeLightButton_ = nullptr;
     QLineEdit* nameEdit_ = nullptr;
     QComboBox* materialCombo_ = nullptr;
     QComboBox* lightTypeCombo_ = nullptr;
